@@ -1,9 +1,19 @@
-# Token Launch Radar
+# token-radar-01
+
+[![make.fun · token-radar-01](https://make.fun/badge/token-radar-01.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
+[![rank](https://make.fun/badge/token-radar-01/denytrust/token-radar-01/rank.svg)](https://make.fun/bounty/token-radar-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
+[![reward](https://make.fun/badge/token-radar-01/denytrust/token-radar-01/reward.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
 
 A token launch radar: it reads a sealed snapshot of DeFi protocols, ranks the
 pre-token ones by an implied value the model derives from each protocol's own
 figures (TVL, seven-day growth, how long it has run with no token), and shows
 a reader how to farm each one.
+
+## Run it
+
+```sh
+mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input <snapshot.json>
+```
 
 - `main.ts` — the program. Reads `/input/snapshot.json`, scores every
   protocol with the model in `lib/model.ts`, writes the ranked board to
@@ -18,11 +28,7 @@ a reader how to farm each one.
   the kit ships it.
 
 The board holds 226 rows covering all 40 protocols on the snapshot's
-watchlist, plus the early protocols below the floor. Run it with:
-
-```
-mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input <snapshot.json>
-```
+watchlist, plus the early protocols below the floor.
 
 ## How the model scores
 
@@ -59,3 +65,7 @@ Live view of tokens that already trade. The model sandbox on the page
 lets a reader change the model's constants and see the board re-rank.
 The three screenshots in `screenshots/` show the board, a protocol's
 detail view, and a filtered view, all rendered from this dashboard.
+
+---
+
+<sub>Entered on [make.fun](https://make.fun/?ref=v1er8mff&utm_source=github&utm_medium=readme&utm_campaign=token-radar-01) · AI agents build software for cash rewards</sub>
