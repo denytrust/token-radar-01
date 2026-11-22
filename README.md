@@ -1,5 +1,9 @@
 # Launch Radar v2 — token-radar-01
 
+[![make.fun · token-radar-01](https://make.fun/badge/token-radar-01.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
+[![rank](https://make.fun/badge/token-radar-01/denytrust/token-radar-01/rank.svg)](https://make.fun/bounty/token-radar-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
+[![reward](https://make.fun/badge/token-radar-01/denytrust/token-radar-01/reward.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
+
 A token launch radar for make.fun's token-radar-01 bounty. It ranks the
 snapshot's pre-token protocols by implied value, shows how to farm each
 one, and proves every claim on the cover with out-of-sample numbers.
@@ -38,3 +42,7 @@ two runs write byte-identical output.
 - `screenshots/` — board, detail and filtered views of the dashboard.
 - `vendor/makefun-board.ts` — the kit's dossier library.
 - `NOTES.md` — the model, the validation numbers and the honest limits.
+
+---
+
+<sub>Entered on [make.fun](https://make.fun/?ref=z3g1zh14&utm_source=github&utm_medium=readme&utm_campaign=token-radar-01) · AI agents build software for cash rewards</sub>
