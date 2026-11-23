@@ -1,6 +1,9 @@
-// Launch Radar v2 dashboard. Renders window.RADAR (data.js) and, for the
+// Launch Radar v3 dashboard. Renders window.RADAR (data.js) and, for the
 // integrity strip, recomputes every implied value, farm number and verdict
 // from the model and checks them against the shipped board.
+// v3 rebuilds the token odds: v2's odds barely beat the base rate
+// (Brier 0.237 vs 0.248). v3 adds the category listing rate and a fixed
+// age encoding (dated flag + log age) and reaches Brier 0.2045 on 5-fold CV.
 (function () {
   var D = window.RADAR;
   var M = D.model, V = D.validation, L = D.ledger, F = D.farm;
@@ -122,14 +125,14 @@
   // ---- render ----
   var app = document.getElementById("app");
   var h = "";
-  h += "<h1>Launch Radar v2 <small>token-radar-01 · every value term fitted and tested held-out twice</small></h1>";
+  h += "<h1>Launch Radar v3 <small>token-radar-01 · value model fitted and tested held-out twice · token odds rebuilt</small></h1>";
   h += "<p class='sub'>Snapshot " + esc(D.asOf) + " · " + L.total + " protocols · " +
     "value model fit on " + M.nFit + " listed comps · token odds from the peers' record</p>";
 
   h += "<div class='kpi'>";
   h += "<div><b>" + fmtX(Math.exp(V.wf_size)) + " vs " + fmtX(Math.exp(V.wf_flat)) + "</b><span>out-of-sample miss, walk-forward: fitted size curve vs flat multiple</span></div>";
   h += "<div><b>" + V.honesty_pct.toFixed(1) + "%</b><span>of true caps inside the printed P25–P75 range (leave-one-out)</span></div>";
-  h += "<div><b>" + M.oddsCvBrier.toFixed(3) + " vs " + M.oddsBaseBrier.toFixed(3) + "</b><span>token-odds Brier, 5-fold CV vs base rate</span></div>";
+  h += "<div><b>" + M.oddsCvBrier.toFixed(3) + " vs " + M.oddsBaseBrier.toFixed(3) + "</b><span>token-odds Brier, 5-fold CV vs base rate — v2 was 0.237, v3 is 0.205</span></div>";
   h += "<div><b>1 of 6</b><span>value terms pass both tests: the size curve. Category, family, growth, age, chain count do not.</span></div>";
   h += "<div><b>" + verdicts.FARM + " of " + rows.length + "</b><span>farmable by net after fees (FARM verdict)</span></div>";
   h += "<div><b>" + wlCovered + "/40</b><span>watchlist covered</span></div>";
@@ -167,12 +170,19 @@
   });
   h += "</table>";
   h += "<h3>Token odds and the blind holdout</h3>";
-  h += "<p class='legend'>Token odds: logistic P(a protocol ever records a token) on age, ln TVL, 7d growth and family size, fit on all " +
+  h += "<p class='legend'>Token odds, rebuilt in v3: logistic P(a protocol ever records a token) on ln TVL, 7d growth, family size, " +
+    "the protocol's category listing rate, and protocol age as a dated flag plus log age — fit on all " +
     L.total + " protocols. Brier " + M.oddsCvBrier.toFixed(3) + " (5-fold CV) vs " + M.oddsBaseBrier.toFixed(3) +
-    " for always guessing the base rate " + M.oddsBaseRate.toFixed(3) + ". " +
+    " for always guessing the base rate " + M.oddsBaseRate.toFixed(3) + " (v2 was 0.237). " +
+    "Why it changed: v2's single age term treated protocols with no listed_at date as 30 days old, but those protocols " +
+    "list at 0.788 — the highest of any group — so the term pointed the wrong way; and category carries real signal " +
+    "(Lending lists at 0.787, Risk Curators at 0.128). Fitting only on old protocols was tried and hurts badly " +
+    "(CV Brier 0.30), so it is not used. " +
     "Blind holdout: the " + V.holdout_n + " newest listings, never used to fit. Size-curve miss " +
     fmtX(Math.exp(V.holdout_miss)) + " vs flat " + fmtX(Math.exp(V.holdout_flat)) +
     " (excluding the 6 extreme-ratio comps, " + fmtX(Math.exp(V.holdout_ex_extreme_miss)) + "). " +
+    "Winsorizing the value model was tested and does not help: no clip improves the holdout without hurting " +
+    "leave-one-out and walk-forward, so the value model is unchanged from v2. " +
     "Top-10 ranks are stable across 200 bootstrap refits: ranks 1–6 never move, rank 7–9 move within 7–9, rank 10 sits 10–11.</p>";
 
   h += "<h2>Integrity strip</h2>";
