@@ -1,12 +1,17 @@
-// Token Radar v2 — Launch Radar: every value term fitted and tested held-out
-// twice, token odds from the peers' record, integrity strip, costed farm
-// verdicts. Entry for make.fun token-radar-01.
+// Token Radar v3 — Launch Radar: the value model is unchanged from v2
+// (size curve, LOO x3.33 / walk-forward x2.53), but the token-odds model
+// is rebuilt. v2's odds barely beat the base rate (Brier 0.237 vs 0.248)
+// because its age feature was mis-specified and it ignored category.
+// v3's odds are a logistic on ln TVL, 7d growth, family size, the
+// protocol's category listing rate, and protocol age (a dated flag plus
+// log age): 5-fold CV Brier 0.2045 vs base 0.2476. Winsorizing the value
+// model was tested and does not help (no variant improves the blind
+// holdout without hurting LOO / walk-forward), so it is not used.
 //
-// Reads the sealed snapshot (/input/snapshot.json) and the fitted model
-// (fit.json, shipped in this repo: value-model coefficients, token-odds
-// coefficients, 200 bootstrap refits, validation numbers), ranks the
-// pre-token protocols by implied value, and writes the board, the
-// dashboard's data, and the dossier to /output.
+// Entry for make.fun token-radar-01. Reads the sealed snapshot
+// (/input/snapshot.json) and the fitted model (fit.json, shipped in this
+// repo), ranks the pre-token protocols by implied value, and writes the
+// board, the dashboard's data, and the dossier to /output.
 //
 // Run locally:  mkdir -p out && MAKEFUN_BOT_DIR=. MAKEFUN_OUTPUT_DIR=out \
 //                 node main.ts --input <kit>/input/snapshot.json
@@ -59,7 +64,8 @@ function fmtMoney1(n: number): string {
 interface FitJson {
   value_model: { intercept: number; slope: number; centre: number; n_fit: number;
     boot_se_intercept: number; boot_se_slope: number; slope_ci95: [number, number] };
-  odds_model: { coef: number[]; base_rate: number; base_brier: number; cv_brier: number };
+  odds_model: { coef: number[]; features: string[]; base_rate: number;
+    base_brier: number; cv_brier: number; cv_folds: number[] };
   validation: Record<string, unknown>;
   ledger: { board: number; listed: number; excluded: number; total: number;
     watchlist: number; parent20: number };
@@ -173,12 +179,30 @@ function main(): void {
   const fa = fit.farm_assumptions;
   const vm = fit.value_model;
   const oc = fit.odds_model.coef;
+  const baseRate = fit.odds_model.base_rate;
 
   // family sizes, counted over the whole snapshot (a feature, not a label)
   const famCount = new Map<string, number>();
   for (const p of prots) {
     const f = familyOf(p.name);
     famCount.set(f, (famCount.get(f) || 0) + 1);
+  }
+
+  // category listing rates, counted over the whole snapshot (v3 odds
+  // feature). A category's rate is the share of its protocols that
+  // already record a token; unseen categories fall back to the base rate.
+  const catTotal = new Map<string, number>();
+  const catListed = new Map<string, number>();
+  for (const p of prots) {
+    const c = p.category === null ? "" : p.category;
+    catTotal.set(c, (catTotal.get(c) || 0) + 1);
+    if (hasToken(p)) catListed.set(c, (catListed.get(c) || 0) + 1);
+  }
+  function catRate(cat: string | null): number {
+    const c = cat === null ? "" : cat;
+    const tot = catTotal.get(c);
+    if (!tot) return baseRate;
+    return (catListed.get(c) || 0) / tot;
   }
 
   // the 20 protocols the house watchlist excludes via parentProtocol, a
@@ -194,11 +218,18 @@ function main(): void {
   // listed comps, for nearest priced peers
   const comps = prots.filter((p) => hasToken(p) && p.mcap_usd && p.mcap_usd > 0 && p.tvl_usd > 0);
 
+  // v3 token odds: logistic on [1, ln TVL - 17, growth/10, family size,
+  // category rate - base rate, dated, age2]. "dated" is 1 when the
+  // snapshot carries a listed_at date; "age2" is ln(age) - 6 for dated
+  // protocols and 0 otherwise. v2's single age term treated dateless
+  // protocols as 30 days old, which is backwards: dateless protocols
+  // list at 0.788, the highest of any group.
   function oddsOf(p: Proto): number {
     const a = ageDays(p, asOf);
-    const la = Math.log(a === null ? 30 : Math.max(a, 30));
-    const feats = [1, la - 6, Math.log(p.tvl_usd) - 17,
-      clamp(growth(p), -50, 50) / 10, famCount.get(familyOf(p.name)) || 1];
+    const feats = [1, Math.log(p.tvl_usd) - 17,
+      clamp(growth(p), -50, 50) / 10, famCount.get(familyOf(p.name)) || 1,
+      catRate(p.category) - baseRate, a === null ? 0 : 1,
+      a === null ? 0 : Math.log(Math.max(a, 30)) - 6];
     let z = 0;
     for (let i = 0; i < oc.length; i++) z += oc[i] * feats[i];
     return sigmoid(z);

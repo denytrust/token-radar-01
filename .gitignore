@@ -1,3 +1,5 @@
 out/
 out2/
 transcripts.tar.gz
+*.py
+board_rows.json
