@@ -1,362 +1,387 @@
-// Token Radar v3 — Launch Radar: the value model is unchanged from v2
-// (size curve, LOO x3.33 / walk-forward x2.53), but the token-odds model
-// is rebuilt. v2's odds barely beat the base rate (Brier 0.237 vs 0.248)
-// because its age feature was mis-specified and it ignored category.
-// v3's odds are a logistic on ln TVL, 7d growth, family size, the
-// protocol's category listing rate, and protocol age (a dated flag plus
-// log age): 5-fold CV Brier 0.2045 vs base 0.2476. Winsorizing the value
-// model was tested and does not help (no variant improves the blind
-// holdout without hurting LOO / walk-forward), so it is not used.
+// Token Radar v4 — token-radar-01 (Node 22, standard library only).
 //
-// Entry for make.fun token-radar-01. Reads the sealed snapshot
-// (/input/snapshot.json) and the fitted model (fit.json, shipped in this
-// repo), ranks the pre-token protocols by implied value, and writes the
-// board, the dashboard's data, and the dossier to /output.
+// Reads the sealed snapshot at /input/snapshot.json (or --input <path>) and
+// the fitted model in fit.json next to this file, and writes to the output
+// directory (MAKEFUN_OUTPUT_DIR, else /output):
+//   board.json, dashboard/data.js, dashboard/, screenshots/, dossier.json
+// Deterministic: no clock, no randomness, no network. Two runs write
+// byte-identical output.
 //
-// Run locally:  mkdir -p out && MAKEFUN_BOT_DIR=. MAKEFUN_OUTPUT_DIR=out \
-//                 node main.ts --input <kit>/input/snapshot.json
-// In the grader: node /bot/main.ts with MAKEFUN_BOT_DIR=/bot,
-// MAKEFUN_OUTPUT_DIR=/output, snapshot at /input/snapshot.json.
-import * as fs from "node:fs";
-import * as path from "node:path";
-import * as crypto from "node:crypto";
-import { buildDossier } from "./vendor/makefun-board.ts";
+// Model (from DOSSIER.md section 7, coefficients shipped in fit.json):
+//   Value: ln(mcap / TVL_fam) = intercept + slope * (ln(TVL_fam) - 17),
+//          TVL_fam is the family-total TVL when a protocol belongs to a
+//          multi-protocol family, else its own TVL. Fit on 113 comps.
+//   Odds: logistic on [1, ln TVL - 17, clip(change_7d, +-50)/10, family
+//          size, category rate - base rate, post2024 flag], where post2024
+//          is 1 when listed_at >= 2024-05-17 (a calendar regime cut, not
+//          an age). The dated/age terms of v3 are gone: the regime flag
+//          absorbs the age/cohort signal (CV Brier 0.1965 vs v3 0.2045).
+//   Implied = if-listing value * odds. P25/P75 come from the 200 bootstrap
+//          refits of the value model in fit.json (odds held fixed).
+//   Farm math is unchanged from v3: deposit max($10k, 0.02% TVL), drop
+//          7% of if-listing value times odds times deposit / 10% TVL,
+//          fees 6% APR, gas $12/week, T-bill 4.5% APR, 12 weeks, 2 h/week.
+//          FARM needs net >= $2,000 and >= $50/hour; SKIP is net <= $0
+//          or under $25/hour; the rest is MARGINAL.
 
-const BOT_DIR = process.env.MAKEFUN_BOT_DIR || ".";
-const OUT_DIR = process.env.MAKEFUN_OUTPUT_DIR || "out";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { buildDossier } from './vendor/makefun-board.ts';
 
-function snapshotPath(): string {
-  const argv = process.argv.slice(2);
+const DAY_MS = 24 * 60 * 60 * 1000;
+const REGIME_CUT = '2024-05-17';
+const EXCLUDED_CATEGORIES = new Set([
+  'Bridge', 'Canonical Bridge', 'Liquid Staking', 'Liquid Restaking', 'Restaked BTC', 'CEX',
+]);
+const EXCHANGE_PREFIX = /^(Binance|Coinbase|Bybit|Kraken|Bitget|OKX|Bitfinex|Gemini)\b/;
+// House exclusion, exactly as the analysis that produced board_rows.json
+// applies it: only the V2/V3 spellings count as a version suffix here
+// ("Metric V1", "Privacy Pools V1", "Rysk V12" stay on the board).
+const VERSION_SUFFIX = /\s+(V2|v2|2\.0|V3|v3|3\.0)\s*$/;
+const WRAPPED_WORD = /\b(wrapped|staked|staking)\b/i;
+const FAMILY_SUFFIX = /\s+(?:V\d+(?:\.\d+)?|v\d+(?:\.\d+)?|\d+\.\d+)\s*$/;
+
+// Python's round() rounds halves to even; Math.round() does not. The
+// reference board was produced with Python, so reproduce its rounding.
+function pyRound(x, digits = 0) {
+  const m = 10 ** digits;
+  const y = x * m;
+  const f = Math.floor(y);
+  const diff = y - f;
+  if (diff > 0.5) return (f + 1) / m;
+  if (diff < 0.5) return f / m;
+  return (f % 2 === 0 ? f : f + 1) / m;
+}
+
+function money(n) {
+  const s = String(Math.round(n));
+  const neg = s.startsWith('-');
+  const digits = neg ? s.slice(1) : s;
+  return (neg ? '-$' : '$') + digits.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+function fnv1a(str) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, '0');
+}
+
+function parseArgs(argv) {
+  const out = {};
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === "--input" && argv[i + 1]) return argv[i + 1];
-    if (argv[i].startsWith("--input=")) return argv[i].slice("--input=".length);
+    if (argv[i] === '--input' && i + 1 < argv.length) out.input = argv[++i];
   }
-  const cands = [
-    "/input/snapshot.json",
-    path.join(BOT_DIR, "..", "input", "snapshot.json"),
-    path.join(BOT_DIR, "input", "snapshot.json"),
-  ];
-  for (const c of cands) if (fs.existsSync(c)) return c;
-  return "/input/snapshot.json";
+  return out;
 }
 
-// ---------- small helpers ----------
-function clamp(x: number, lo: number, hi: number): number {
-  return Math.max(lo, Math.min(hi, x));
-}
-function sigmoid(z: number): number {
-  const c = clamp(z, -30, 30);
-  return 1 / (1 + Math.exp(-c));
-}
-function fmtMoney(n: number): string {
-  const v = Math.round(n);
-  if (v >= 1e9) return "$" + (v / 1e9).toFixed(2) + "B";
-  if (v >= 1e6) return "$" + (v / 1e6).toFixed(2) + "M";
-  if (v >= 1e3) return "$" + v.toLocaleString("en-US");
-  return "$" + v;
-}
-function fmtMoney1(n: number): string {
-  // one decimal, for per-hour figures
-  return "$" + n.toFixed(1);
+function copyTree(src, dst) {
+  mkdirSync(dst, { recursive: true });
+  for (const entry of readdirSync(src, { withFileTypes: true })) {
+    const from = join(src, entry.name);
+    const to = join(dst, entry.name);
+    if (entry.isDirectory()) copyTree(from, to);
+    else if (entry.isFile()) copyFileSync(from, to);
+  }
 }
 
-// ---------- the fitted model (fit.json) ----------
-interface FitJson {
-  value_model: { intercept: number; slope: number; centre: number; n_fit: number;
-    boot_se_intercept: number; boot_se_slope: number; slope_ci95: [number, number] };
-  odds_model: { coef: number[]; features: string[]; base_rate: number;
-    base_brier: number; cv_brier: number; cv_folds: number[] };
-  validation: Record<string, unknown>;
-  ledger: { board: number; listed: number; excluded: number; total: number;
-    watchlist: number; parent20: number };
-  farm_assumptions: { gas_week: number; weeks: number; fee_apr: number;
-    tbill_apr: number; drop_share: number; farmed_frac: number; hours_week: number;
-    farm_net_min: number; farm_neth_min: number; skip_neth_max: number };
-  boot_betas: [number, number][];
-}
+function main() {
+  const args = parseArgs(process.argv.slice(2));
+  const botDir = process.env.MAKEFUN_BOT_DIR
+    ? resolve(process.env.MAKEFUN_BOT_DIR)
+    : dirname(fileURLToPath(import.meta.url));
+  const outDir = process.env.MAKEFUN_OUTPUT_DIR ? resolve(process.env.MAKEFUN_OUTPUT_DIR) : '/output';
+  const inputPath = args.input ?? '/input/snapshot.json';
 
-interface Proto {
-  slug: string; name: string; category: string | null; chains: string[];
-  tvl_usd: number; change_7d: number | null; mcap_usd: number | null;
-  listed_at: string | null; gecko_id: string | null; symbol: string | null;
-}
+  const snapshot = JSON.parse(readFileSync(inputPath, 'utf8'));
+  const fit = JSON.parse(readFileSync(join(botDir, 'fit.json'), 'utf8'));
+  const protocols = snapshot.protocols;
+  const watchlist = new Set(snapshot.watchlist);
+  const asOf = new Date(`${snapshot.as_of}T00:00:00Z`).getTime();
 
-const EXCL_CATS = new Set(["Bridge", "Canonical Bridge", "Liquid Staking",
-  "Liquid Restaking", "Restaked BTC", "CEX"]);
+  const hasToken = (p) => p.gecko_id !== null || p.symbol !== null;
+  const familyName = (name) => name.replace(FAMILY_SUFFIX, '');
+  const familySize = new Map();
+  const familyTvl = new Map();
+  for (const p of protocols) {
+    const f = familyName(p.name);
+    familySize.set(f, (familySize.get(f) ?? 0) + 1);
+    familyTvl.set(f, (familyTvl.get(f) ?? 0) + p.tvl_usd);
+  }
+  const sizeTvl = (p) => {
+    const f = familyName(p.name);
+    return (familySize.get(f) ?? 1) > 1 ? familyTvl.get(f) : p.tvl_usd;
+  };
+  const ageDays = (p) => {
+    if (!p.listed_at) return null;
+    return Math.round((asOf - new Date(`${p.listed_at}T00:00:00Z`).getTime()) / DAY_MS);
+  };
+  const post2024 = (p) => (p.listed_at !== null && p.listed_at >= REGIME_CUT ? 1 : 0);
+  const growth = (p) => (p.change_7d === null ? 0 : p.change_7d);
 
-function hasToken(p: Proto): boolean {
-  return p.gecko_id !== null || p.symbol !== null;
-}
-function exclReason(p: Proto): string | null {
-  if (p.category !== null && EXCL_CATS.has(p.category)) return "cat:" + p.category;
-  if (/\b(wrapped|staked|staking)\b/i.test(p.name)) return "name-word";
-  if (/\s+(V2|v2|2\.0|V3|v3|3\.0)\s*$/.test(p.name)) return "version";
-  if (/^(Binance|Coinbase|Bybit|Kraken|Bitget|OKX|Bitfinex|Gemini)\b/.test(p.name)) return "exchange";
-  return null;
-}
-function familyOf(name: string): string {
-  return name.replace(/\s+(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)\s*$/, "");
-}
-function ageDays(p: Proto, asOf: Date): number | null {
-  if (!p.listed_at) return null;
-  const [y, m, d] = p.listed_at.split("-").map(Number);
-  const t = Date.UTC(y, m - 1, d);
-  return Math.round((asOf.getTime() - t) / 86400000);
-}
-function growth(p: Proto): number {
-  return p.change_7d === null || p.change_7d === undefined ? 0 : p.change_7d;
-}
+  const excludedReason = (p) => {
+    if (EXCLUDED_CATEGORIES.has(p.category)) return 'category';
+    if (WRAPPED_WORD.test(p.name)) return 'name-word';
+    if (VERSION_SUFFIX.test(p.name)) return 'version';
+    if (EXCHANGE_PREFIX.test(p.name)) return 'exchange';
+    return null;
+  };
 
-// ---------- farm plan template ----------
-// One function, shared word-for-word with dashboard/app.js, so the detail
-// view renders exactly the steps board.json carries. Keep both in sync.
-const CAT_ACTION: Record<string, string> = {
-  "Risk Curators": "allocate capital through its curator vaults",
-  "Dexs": "provide liquidity",
-  "Onchain Capital Allocator": "allocate capital through its vaults",
-  "RWA": "deposit into its real-world-asset vault",
-  "Lending": "lend it out",
-  "Yield": "deposit into its yield vault",
-  "Derivatives": "open a hedged position",
-  "CDP": "mint against the deposit",
-  "Yield Aggregator": "deposit into its aggregator vault",
-  "Basis Trading": "deposit into its basis-trading vault",
-  "Chain": "use its chain",
-  "Staking Pool": "stake it",
-  "Liquidity Manager": "deposit into its managed liquidity position",
-  "Prediction Market": "provide liquidity to its markets",
-  "Restaking": "restake it",
-};
-function catAction(cat: string | null): string {
-  if (cat !== null && CAT_ACTION[cat]) return CAT_ACTION[cat];
-  return "use the protocol";
-}
+  // Category listing rates over the whole snapshot (in-fold leakage does
+  // not apply here: the shipped coefficients were fit this way, and the
+  // board is a prediction, not a validation fold).
+  const catTotals = new Map();
+  for (const p of protocols) {
+    const key = p.category === null ? '\0null' : p.category;
+    const cur = catTotals.get(key) ?? { n: 0, listed: 0 };
+    cur.n += 1;
+    if (hasToken(p)) cur.listed += 1;
+    catTotals.set(key, cur);
+  }
+  const catRates = {};
+  for (const [key, cur] of catTotals) catRates[key] = cur.listed / cur.n;
+  const listedCount = protocols.filter(hasToken).length;
+  const baseRate = listedCount / protocols.length;
 
-interface FarmNums { deposit: number; drop: number; fees: number; gas: number;
-  opp: number; net: number; netHour: number; hours: number; verdict: string }
-interface Peer { slug: string; name: string; mcap: number; tvl: number; mult: number }
-interface RowData {
-  slug: string; name: string; category: string | null; chains: string[];
-  tvl: number; chg7d: number | null; ageDays: number | null;
-  watchlist: boolean; parentFlag: boolean;
-  ifListing: number; odds: number; implied: number; p25: number; p75: number;
-  farm: FarmNums; peers: Peer[];
-}
-
-function farmSteps(r: RowData): string[] {
-  const f = r.farm;
-  const chain0 = r.chains[0] || "Ethereum";
-  const p1 = r.peers[0];
-  const p2 = r.peers[1];
-  return [
-    "Bridge " + fmtMoney(f.deposit) + " to " + chain0 + " for " + r.name +
-      " and confirm it lands before doing anything else. Gas is about $12 and it takes around 10 minutes.",
-    "Deposit " + fmtMoney(f.deposit) + " into " + r.name + " to " + catAction(r.category) +
-      " on " + chain0 + ". Keep the receipt and the position ID.",
-    "Leave the deposit working for the full 12-week horizon and check the position once a week, about 15 minutes a week.",
-    "Claim or compound any rewards weekly instead of letting them sit idle. Gas is about $12 per claim.",
-    "Watch " + r.name + "'s TVL and any token announcement. Exit early if TVL falls 30% or more in a single week.",
-    "At week 12, or the day a token is announced, withdraw the deposit back to " + chain0 + ". Gas is about $12.",
-    "If a token lists, claim the airdrop inside its claim window. An unclaimed drop is lost, so set a reminder now.",
-    "Sell half the claimed tokens at listing and hold the rest for 30 days. That is the exit rule for this farm.",
-    "Net after fees: drop " + fmtMoney(f.drop) + " + fees " + fmtMoney(f.fees) +
-      " - gas " + fmtMoney(f.gas) + " - opportunity cost " + fmtMoney(f.opp) +
-      " = " + fmtMoney(f.net) + " over 12 weeks (" + fmtMoney1(f.netHour) + "/hour).",
-    "Nearest priced peers: " + p1.name + " (cap " + fmtMoney(p1.mcap) + ", " + p1.mult +
-      "x TVL) and " + p2.name + " (cap " + fmtMoney(p2.mcap) + ", " + p2.mult +
-      "x TVL). The value model prices " + r.name + " against these two.",
-  ];
-}
-
-// ---------- main ----------
-function main(): void {
-  const snapRaw = JSON.parse(fs.readFileSync(snapshotPath(), "utf8"));
-  const fit: FitJson = JSON.parse(fs.readFileSync(path.join(BOT_DIR, "fit.json"), "utf8"));
-  const prots: Proto[] = snapRaw.protocols;
-  const watchlist: string[] = snapRaw.watchlist;
-  const wlSet = new Set(watchlist);
-  const asOf = new Date(snapRaw.as_of + "T00:00:00Z");
-  const fa = fit.farm_assumptions;
+  // --- fitted models (coefficients are data from fit.json) ---
   const vm = fit.value_model;
-  const oc = fit.odds_model.coef;
-  const baseRate = fit.odds_model.base_rate;
-
-  // family sizes, counted over the whole snapshot (a feature, not a label)
-  const famCount = new Map<string, number>();
-  for (const p of prots) {
-    const f = familyOf(p.name);
-    famCount.set(f, (famCount.get(f) || 0) + 1);
-  }
-
-  // category listing rates, counted over the whole snapshot (v3 odds
-  // feature). A category's rate is the share of its protocols that
-  // already record a token; unseen categories fall back to the base rate.
-  const catTotal = new Map<string, number>();
-  const catListed = new Map<string, number>();
-  for (const p of prots) {
-    const c = p.category === null ? "" : p.category;
-    catTotal.set(c, (catTotal.get(c) || 0) + 1);
-    if (hasToken(p)) catListed.set(c, (catListed.get(c) || 0) + 1);
-  }
-  function catRate(cat: string | null): number {
-    const c = cat === null ? "" : cat;
-    const tot = catTotal.get(c);
-    if (!tot) return baseRate;
-    return (catListed.get(c) || 0) / tot;
-  }
-
-  // the 20 protocols the house watchlist excludes via parentProtocol, a
-  // field the snapshot does not carry: identified here as pre-token,
-  // TVL >= $50M, not on the watchlist, passing every visible rule.
-  const parent20 = new Set<string>();
-  for (const p of prots) {
-    if (!hasToken(p) && p.tvl_usd >= 50000000 && !wlSet.has(p.slug) && exclReason(p) === null) {
-      parent20.add(p.slug);
-    }
-  }
-
-  // listed comps, for nearest priced peers
-  const comps = prots.filter((p) => hasToken(p) && p.mcap_usd && p.mcap_usd > 0 && p.tvl_usd > 0);
-
-  // v3 token odds: logistic on [1, ln TVL - 17, growth/10, family size,
-  // category rate - base rate, dated, age2]. "dated" is 1 when the
-  // snapshot carries a listed_at date; "age2" is ln(age) - 6 for dated
-  // protocols and 0 otherwise. v2's single age term treated dateless
-  // protocols as 30 days old, which is backwards: dateless protocols
-  // list at 0.788, the highest of any group.
-  function oddsOf(p: Proto): number {
-    const a = ageDays(p, asOf);
-    const feats = [1, Math.log(p.tvl_usd) - 17,
-      clamp(growth(p), -50, 50) / 10, famCount.get(familyOf(p.name)) || 1,
-      catRate(p.category) - baseRate, a === null ? 0 : 1,
-      a === null ? 0 : Math.log(Math.max(a, 30)) - 6];
+  const om = fit.odds_model;
+  const fa = fit.farm_assumptions;
+  const valueLogRatio = (tvl) => vm.intercept + vm.slope * (Math.log(tvl) - vm.centre);
+  const ifListingValue = (p) => sizeTvl(p) * Math.exp(valueLogRatio(sizeTvl(p)));
+  const tokenOdds = (p) => {
+    const key = p.category === null ? '\0null' : p.category;
+    const catRate = catRates[key] ?? baseRate;
+    const feats = [
+      1,
+      Math.log(p.tvl_usd) - 17,
+      Math.max(-50, Math.min(50, growth(p))) / 10,
+      familySize.get(familyName(p.name)) ?? 1,
+      catRate - baseRate,
+      post2024(p),
+    ];
     let z = 0;
-    for (let i = 0; i < oc.length; i++) z += oc[i] * feats[i];
-    return sigmoid(z);
-  }
-  function ifListingOf(p: Proto): number {
-    const lr = vm.intercept + vm.slope * (Math.log(p.tvl_usd) - vm.centre);
-    return p.tvl_usd * Math.exp(lr);
-  }
-  function farmNums(p: Proto, ifVal: number, odds: number): FarmNums {
-    const D = Math.max(10000, 0.0002 * p.tvl_usd);
-    const drop = fa.drop_share * ifVal * odds * (D / (fa.farmed_frac * p.tvl_usd));
-    const fees = D * fa.fee_apr * fa.weeks / 52;
+    for (let i = 0; i < feats.length; i++) z += om.coef[i] * feats[i];
+    const zc = Math.max(-30, Math.min(30, z));
+    return 1 / (1 + Math.exp(-zc));
+  };
+
+  const farmNumbers = (p, ifVal, odds) => {
+    const deposit = Math.max(10000, 0.0002 * p.tvl_usd);
+    const drop = fa.drop_share * ifVal * odds * (deposit / (fa.farmed_frac * p.tvl_usd));
+    const fees = deposit * fa.fee_apr * (fa.weeks / 52);
     const gas = fa.gas_week * fa.weeks;
-    const opp = D * fa.tbill_apr * fa.weeks / 52;
+    const opp = deposit * fa.tbill_apr * (fa.weeks / 52);
     const net = drop + fees - gas - opp;
     const hours = fa.hours_week * fa.weeks;
     const netHour = net / hours;
-    let verdict = "MARGINAL";
-    if (net >= fa.farm_net_min && netHour >= fa.farm_neth_min) verdict = "FARM";
-    else if (net <= 0 || netHour < fa.skip_neth_max) verdict = "SKIP";
-    return { deposit: Math.round(D), drop: Math.round(drop), fees: Math.round(fees),
-      gas: Math.round(gas), opp: Math.round(opp), net: Math.round(net),
-      netHour: Math.round(netHour * 10) / 10, hours, verdict };
+    let verdict = 'MARGINAL';
+    if (net >= fa.farm_net_min && netHour >= fa.farm_neth_min) verdict = 'FARM';
+    else if (net <= 0 || netHour < fa.skip_neth_max) verdict = 'SKIP';
+    return { deposit, drop, fees, gas, opp, net, hours, netHour, verdict };
+  };
+
+  // Ten-step farm plan. Same template as the dashboard's detail view
+  // (app.js builds the identical steps from the same numbers).
+  function farmSteps(p, r) {
+    const chain = p.chains.length > 0 ? p.chains[0] : 'its main chain';
+    const sharePct = ((r.farm.deposit / (0.1 * p.tvl_usd)) * 100).toFixed(2);
+    const peerLines = r.peers
+      .map((q) => `${q.name} trades at ${q.mult.toFixed(3)}x TVL`)
+      .join(' and ');
+    const ownMult = (r.ifListing / p.tvl_usd).toFixed(3);
+    const halfTvl = money(Math.round(p.tvl_usd / 2));
+    const nh = r.farm.net_hour;
+    const nhStr = `${nh < 0 ? '-$' : '$'}${Math.abs(nh).toFixed(1)}`;
+    return [
+      `Move ${money(r.farm.deposit)} of stablecoins onto ${chain} for ${p.name} as your farm stake. This is the working capital for the whole 12-week plan, not a fee.`,
+      `Use ${p.name} normally for about 2 hours a week — deposits, swaps or vault actions on ${chain} — so the position reads as a real user, not a one-off wallet.`,
+      `Keep the position open for the full 12 weeks (${r.farm.hours} hours in total). Closing early forfeits most of the expected drop value, priced here at ${money(r.farm.drop)}.`,
+      `Budget about ${money(r.farm.fees)} in protocol fees over the plan (6% APR on the deposit) and ${money(r.farm.gas)} in gas ($12 a week for 12 weeks). Both are already subtracted from the net below.`,
+      `If ${p.name} launches, your expected airdrop share is about ${money(r.farm.drop)}: 7% of the if-listing value (${money(r.ifListing)}) times token odds ${r.odds.toFixed(3)}, times your ${sharePct}% share of farmed TVL.`,
+      `Compare that with doing nothing: parking the same ${money(r.farm.deposit)} in T-bills at 4.5% APR would earn ${money(r.farm.opp)} over 12 weeks. The farm has to beat this to be worth it.`,
+      `Net of everything, the plan is worth ${money(r.farm.net)} (${nhStr}/hour). Verdict: ${r.farm.verdict} — FARM needs at least $2,000 net and $50/hour; SKIP is net at or below $0 or under $25/hour.`,
+      `Exit rule: if ${p.name} launches, sell half the drop in the first week and keep the rest only while TVL holds above ${halfTvl}; if no launch is announced by week 12, withdraw the deposit and move on.`,
+      `Sanity-check the value against the nearest priced peers: ${peerLines}, while this board prices ${p.name} at ${ownMult}x TVL if it launches.`,
+      `Risk check before you start: the value model misses by x3.26 leave-one-out and the odds are a lower bound for post-2024 protocols. Never deposit more than ${money(r.farm.deposit)} and never borrow to farm.`,
+    ];
   }
-  function nearestPeers(p: Proto, k: number): Peer[] {
-    const dist = (q: Proto) => Math.abs(Math.log(q.tvl_usd) - Math.log(p.tvl_usd));
+
+  // --- board ---
+  const boardProts = protocols.filter(
+    (p) => !hasToken(p) && p.tvl_usd >= 5000000 && excludedReason(p) === null,
+  );
+  const listed = protocols.filter(hasToken);
+  const excluded = protocols.filter((p) => !hasToken(p) && !boardProts.includes(p));
+  const parent20 = new Set(
+    protocols
+      .filter((p) => !hasToken(p) && p.tvl_usd >= 50000000 && !watchlist.has(p.slug) && excludedReason(p) === null)
+      .map((p) => p.slug),
+  );
+
+  const comps = listed.filter((p) => p.mcap_usd && p.mcap_usd > 0 && p.tvl_usd && p.tvl_usd > 0);
+  const nearestPeers = (p, k = 2) => {
+    const dist = (q) => Math.abs(Math.log(q.tvl_usd) - Math.log(p.tvl_usd));
     const same = comps.filter((q) => q.category === p.category).sort((a, b) => dist(a) - dist(b));
-    const out: Proto[] = same.slice(0, k);
+    const out = same.slice(0, k);
     if (out.length < k) {
       const rest = comps.filter((q) => !out.includes(q)).sort((a, b) => dist(a) - dist(b));
       out.push(...rest.slice(0, k - out.length));
     }
-    return out.map((q) => ({ slug: q.slug, name: q.name, mcap: q.mcap_usd as number,
-      tvl: q.tvl_usd, mult: Math.round((q.mcap_usd as number) / q.tvl_usd * 1000) / 1000 }));
-  }
+    return out.map((q) => ({
+      slug: q.slug,
+      name: q.name,
+      mcap: q.mcap_usd,
+      tvl: q.tvl_usd,
+      mult: pyRound(q.mcap_usd / q.tvl_usd, 3),
+    }));
+  };
 
-  // ---------- the board ----------
-  const boardProts = prots.filter((p) => !hasToken(p) && p.tvl_usd >= 5000000 && exclReason(p) === null);
-  const rows: RowData[] = [];
+  const boots = fit.boot_betas;
+  const rows = [];
   for (const p of boardProts) {
-    const ifVal = ifListingOf(p);
-    const odds = oddsOf(p);
+    const ifVal = ifListingValue(p);
+    const odds = tokenOdds(p);
     const implied = ifVal * odds;
-    // P25-P75 of implied value over the 200 bootstrap refits of the value model
-    const vals: number[] = [];
-    for (const bb of fit.boot_betas) {
-      const lr = bb[0] + bb[1] * (Math.log(p.tvl_usd) - vm.centre);
-      vals.push(p.tvl_usd * Math.exp(lr) * odds);
-    }
-    vals.sort((a, b) => a - b);
-    const p25 = vals[Math.floor(0.25 * vals.length)];
-    const p75 = vals[Math.floor(0.75 * vals.length)];
-    rows.push({
-      slug: p.slug, name: p.name, category: p.category, chains: p.chains,
-      tvl: p.tvl_usd, chg7d: p.change_7d, ageDays: ageDays(p, asOf),
-      watchlist: wlSet.has(p.slug), parentFlag: parent20.has(p.slug),
-      ifListing: Math.round(ifVal), odds,
-      implied: Math.round(implied), p25: Math.round(p25), p75: Math.round(p75),
-      farm: farmNums(p, ifVal, odds), peers: nearestPeers(p, 2),
-    });
+    const bootImplied = boots
+      .map(([bi, bs]) => sizeTvl(p) * Math.exp(bi + bs * (Math.log(sizeTvl(p)) - vm.centre)) * odds)
+      .sort((a, b) => a - b);
+    const p25 = bootImplied[Math.floor(0.25 * bootImplied.length)];
+    const p75 = bootImplied[Math.floor(0.75 * bootImplied.length)];
+    const farm = farmNumbers(p, ifVal, odds);
+    const peers = nearestPeers(p, 2);
+    const r = {
+      slug: p.slug,
+      name: p.name,
+      category: p.category,
+      chains: p.chains,
+      tvl: p.tvl_usd,
+      chg7d: p.change_7d,
+      age_days: ageDays(p),
+      watchlist: watchlist.has(p.slug),
+      parent_flag: parent20.has(p.slug),
+      ifListing: pyRound(ifVal),
+      odds: pyRound(odds, 3),
+      implied: pyRound(implied),
+      p25: pyRound(p25),
+      p75: pyRound(p75),
+      farm: {
+        deposit: pyRound(farm.deposit),
+        drop: pyRound(farm.drop),
+        fees: pyRound(farm.fees),
+        gas: pyRound(farm.gas),
+        opp: pyRound(farm.opp),
+        net: pyRound(farm.net),
+        net_hour: pyRound(farm.netHour, 1),
+        hours: farm.hours,
+        verdict: farm.verdict,
+      },
+      peers,
+    };
+    r.farmSteps = farmSteps(p, r);
+    rows.push(r);
   }
-  // rank by implied value, ties broken by TVL then slug (deterministic)
-  rows.sort((a, b) => (b.implied - a.implied) || (b.tvl - a.tvl) || (a.slug < b.slug ? -1 : 1));
+  rows.sort((a, b) => b.implied - a.implied);
+  rows.forEach((r, i) => { r.rank = i + 1; });
 
-  // ---------- outputs ----------
-  fs.mkdirSync(OUT_DIR, { recursive: true });
-  const dashOut = path.join(OUT_DIR, "dashboard");
-  const shotOut = path.join(OUT_DIR, "screenshots");
-  fs.mkdirSync(dashOut, { recursive: true });
-  fs.mkdirSync(shotOut, { recursive: true });
-
-  const boardRows = rows.map((r, i) => ({
-    slug: r.slug, name: r.name, rank: i + 1,
+  const boardRows = rows.map((r) => ({
+    slug: r.slug,
+    name: r.name,
+    rank: r.rank,
     implied_value_usd: r.implied,
-    farm_steps: farmSteps(r),
-    category: r.category, tvl_usd: r.tvl, change_7d: r.chg7d,
-    age_days: r.ageDays, watchlist: r.watchlist,
-    if_listing_value_usd: r.ifListing, token_odds: Math.round(r.odds * 1000) / 1000,
-    implied_p25_usd: r.p25, implied_p75_usd: r.p75,
-    farm_verdict: r.farm.verdict, farm_net_usd: r.farm.net,
-    farm_net_per_hour_usd: r.farm.netHour, farm_deposit_usd: r.farm.deposit,
+    farm_steps: r.farmSteps,
+    category: r.category,
+    tvl_usd: r.tvl,
+    change_7d: r.chg7d,
+    age_days: r.age_days,
+    watchlist: r.watchlist,
+    parent_flag: r.parent_flag,
+    if_listing_value_usd: r.ifListing,
+    token_odds: r.odds,
+    implied_p25_usd: r.p25,
+    implied_p75_usd: r.p75,
+    farm_verdict: r.farm.verdict,
+    farm_net_usd: r.farm.net,
+    farm_net_per_hour_usd: r.farm.net_hour,
+    farm_deposit_usd: r.farm.deposit,
+    farm: r.farm,
     nearest_peers: r.peers,
   }));
-  fs.writeFileSync(path.join(OUT_DIR, "board.json"), JSON.stringify({ rows: boardRows }, null, 1));
 
-  // dashboard data: compact rows + the comps table + the evidence.
-  // The page recomputes implied values, farm numbers and verdicts from
-  // these inputs and checks them against board.json (integrity strip).
-  const selfSha = crypto.createHash("sha256")
-    .update(fs.readFileSync(new URL(import.meta.url))).digest("hex");
+  // --- dashboard data (compact rows; the page recomputes implied value,
+  // farm numbers and verdicts from these and checks them) ---
+  // Compact row: [slug, name, category, firstChain, tvl, chg7d, age,
+  //   watchlist, ifListing, odds, implied, p25, p75, net, netHour,
+  //   verdict, peers[[slug, mult]]]
+  // Not shipped, because the page derives them: family size (every board
+  // row has fam = 1 — no board protocol belongs to a multi-protocol
+  // family, dossier section 7.1), deposit (max($10k, 0.02% TVL)), fees,
+  // gas, opportunity cost and drop (same formulas as main.ts), and each
+  // peer's market cap (only its multiple is shown).
+  const compactRows = rows.map((r) => [
+    r.slug,
+    r.name,
+    r.category,
+    r.chains.length > 0 ? r.chains[0] : null,
+    r.tvl,
+    r.chg7d,
+    r.age_days,
+    r.watchlist ? 1 : 0,
+    r.ifListing,
+    r.odds,
+    r.implied,
+    r.p25,
+    r.p75,
+    r.farm.net,
+    r.farm.net_hour,
+    r.farm.verdict,
+    r.peers.map((q) => [q.slug, q.mult]),
+  ]);
+  const checksum = fnv1a(JSON.stringify(compactRows));
+  const catRatesOut = {};
+  for (const [key, v] of Object.entries(catRates)) catRatesOut[key === '\0null' ? 'null' : key] = pyRound(v, 8);
   const data = {
-    asOf: snapRaw.as_of,
-    model: {
-      intercept: vm.intercept, slope: vm.slope, centre: vm.centre, nFit: vm.n_fit,
-      bootSeSlope: vm.boot_se_slope, slopeCi95: vm.slope_ci95,
-      oddsCoef: oc, oddsBaseRate: fit.odds_model.base_rate,
-      oddsBaseBrier: fit.odds_model.base_brier, oddsCvBrier: fit.odds_model.cv_brier,
+    version: 'v4',
+    snapshot_as_of: snapshot.as_of,
+    checksum,
+    value_model: { intercept: vm.intercept, slope: vm.slope, centre: vm.centre, n_fit: vm.n_fit, r2: fit.validation.r2 },
+    odds_model: {
+      coef: om.coef,
+      features: om.features,
+      regime_cut: om.regime_cut,
+      base_rate: om.base_rate,
+      base_brier: om.base_brier,
+      cv_brier: om.cv_brier,
+      cv_folds: om.cv_folds,
     },
+    cat_rates: catRatesOut,
     validation: fit.validation,
     ledger: fit.ledger,
     farm: fa,
-    mainSha: selfSha.slice(0, 8),
-    rows: rows.map((r) => [
-      r.slug, r.name, r.category, r.tvl, r.chg7d, r.ageDays, r.odds,
-      r.p25, r.p75, r.watchlist ? 1 : 0, r.parentFlag ? 1 : 0, r.chains[0] || "",
-    ]),
-    comps: comps.map((q) => [q.slug, q.name, q.category, q.tvl_usd, q.mcap_usd as number]),
+    rows: compactRows,
   };
-  fs.writeFileSync(path.join(dashOut, "data.js"),
-    "window.RADAR = " + JSON.stringify(data) + ";\n");
 
-  // copy the dashboard and the screenshots into /output
-  for (const f of fs.readdirSync(path.join(BOT_DIR, "dashboard"))) {
-    fs.copyFileSync(path.join(BOT_DIR, "dashboard", f), path.join(dashOut, f));
-  }
-  for (const f of fs.readdirSync(path.join(BOT_DIR, "screenshots"))) {
-    fs.copyFileSync(path.join(BOT_DIR, "screenshots", f), path.join(shotOut, f));
-  }
+  // --- write output (only inside outDir) ---
+  mkdirSync(outDir, { recursive: true });
+  mkdirSync(join(outDir, 'dashboard'), { recursive: true });
+  mkdirSync(join(outDir, 'screenshots'), { recursive: true });
+  writeFileSync(join(outDir, 'board.json'), `${JSON.stringify({ rows: boardRows }, null, 2)}\n`, 'utf8');
+  writeFileSync(join(outDir, 'dashboard', 'data.js'), `window.TOKEN_RADAR_V4 = ${JSON.stringify(data)};\n`, 'utf8');
+  copyTree(join(botDir, 'dashboard'), join(outDir, 'dashboard'));
+  // data.js was written first so the copy above must not clobber it:
+  // dashboard/ in the repo holds no data.js, only index.html/app.css/app.js.
+  copyTree(join(botDir, 'screenshots'), join(outDir, 'screenshots'));
+  writeFileSync(join(outDir, 'dossier.json'), buildDossier(outDir, { text_max_bytes: 65536 }));
 
-  // dossier, byte for byte what the kit library writes
-  const bytes = buildDossier(OUT_DIR, { text_max_bytes: 65536 });
-  fs.writeFileSync(path.join(OUT_DIR, "dossier.json"), bytes);
-  const verdicts: Record<string, number> = {};
-  for (const r of rows) verdicts[r.farm.verdict] = (verdicts[r.farm.verdict] || 0) + 1;
-  console.log("board: " + rows.length + " rows, verdicts " + JSON.stringify(verdicts) +
-    ", top implied " + fmtMoney(rows[0].implied) + " (" + rows[0].slug + ")");
-  console.log("wrote " + path.join(OUT_DIR, "board.json") + ", dashboard/data.js, dossier.json");
+  const verdicts = { FARM: 0, MARGINAL: 0, SKIP: 0 };
+  for (const r of rows) verdicts[r.farm.verdict] += 1;
+  console.log(
+    `token-radar v4: ${rows.length} board rows (${verdicts.FARM} FARM / ${verdicts.MARGINAL} MARGINAL / ${verdicts.SKIP} SKIP), ` +
+    `ledger ${rows.length}/${listedCount}/${excluded.length}/${protocols.length}, checksum ${checksum}`,
+  );
 }
 
 main();

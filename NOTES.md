@@ -1,81 +1,69 @@
-# Token Radar v3 — Launch Radar
+# Token Radar v4 — Launch Radar
 
-Rebuild of the token-radar-01 entry. v2 (dev 0.9197, 12W 0D 0L) had one
-real weakness: its token-odds model barely beat the base rate
-(Brier 0.237 vs 0.248). v3 rebuilds the odds and keeps everything else
-that worked.
+v4 is an honest incremental fix of v3, not a rebuild. Two model changes,
+both passing the acceptance rule (improve one validation metric materially
+without harming any other):
 
-## What changed in v3
+1. **Odds: + post-2024 regime flag** (`listed_at >= 2024-05-17`). CV Brier
+   0.2045 → **0.1965** (paired bootstrap 90% CI of the per-protocol Brier
+   difference [−0.0124, −0.0029], P(improves) = 1.00). The flag is a
+   censoring correction the data supports: the age gradient is a calendar
+   cliff (pre-May-2024 cohorts list at ~0.78, post at ~0.37), not smooth
+   exposure, so a single-regime survival correction — which would have
+   inflated board odds to 0.545 — was tested and rejected.
+2. **Value: + family-TVL correction.** Comps whose token is family-level
+   but whose TVL is one version slice (aave-v2, sushiswap) are fit on
+   family-total TVL. LOO ×3.33 → ×3.26, holdout ×5.25 → ×4.98, WF
+   unchanged ×2.53, rank stability improves.
 
-**Token odds rebuilt (the only model change).** v2's odds were a logistic
-on age, ln TVL, 7d growth and family size. Two things were wrong with it:
+## The model
 
-1. Its age feature was mis-specified. It treated protocols with no
-   `listed_at` date as 30 days old — but those protocols list at 0.788,
-   the highest rate of any group, so the term pointed the wrong way.
-   v3 replaces the single age term with a dated flag (1 when the snapshot
-   carries a date) plus log age for dated protocols.
-2. It ignored category. Category carries real signal: Lending lists at
-   0.787, Dexs at 0.737, Risk Curators at 0.128. v3 adds the protocol's
-   category listing rate as a feature.
+**Value model.** ln(mcap/TVL_fam) = −1.3177 − 0.3868 × (ln TVL_fam − 17),
+fit on the 113 listed comps (the 15 newest listings are held out blind).
+Bigger TVL, smaller multiple (slope −0.3868, bootstrap SE 0.083, 95% CI
+[−0.553, −0.233]). R² = 0.145 — note: v3's NOTES claimed R² 0.19, which
+does not reproduce on this snapshot (v3's model refits at 0.140 the same
+way); v4 reports 0.145 computed the same way, so the comparison is
+apples-to-apples.
 
-New odds model (logistic, fit on all 758 protocols, 5-fold CV):
-features [1, ln TVL − 17, growth/10, family size, category rate − base
-rate, dated, log age − 6]. Coefficients: intercept −0.569, ln TVL 0.116,
-growth −0.173, family 1.370, category 4.046, dated −1.157, age 0.594.
-**CV Brier 0.2045 vs base 0.2476** (v2: 0.2370). In-sample Brier 0.1791.
-
-Fitting only on old-enough protocols was tried (to reduce censoring) and
-hurts badly (CV Brier 0.30 at age ≥ 180d), so it is not used. Adding chain
-count on top of category + age does not help (0.2067 vs 0.2045).
-
-**Value model unchanged.** The size curve (slope −0.404, LOO ×3.33,
-walk-forward ×2.53) reproduces v2 exactly on the same snapshot
-(2026-11-14 — the kit36 snapshot is identical to the one v2 used, so no
-fresher refit was available; a refit on a newer snapshot before submit
-may still be needed if the kit updates). Winsorizing the value model was
-tested (clips at p1–p99, p2.5–p97.5, p5–p95, |log ratio| ≤ 3/2.5/2, and
-Huber IRLS): no variant improves the blind holdout without hurting
-leave-one-out and walk-forward, so it is not used. Blind holdout stays
-×5.25 (flat ×6.65), ex-extreme ×3.93.
-
-**Board effect.** The better-calibrated odds spread wider (board odds
-min 0.019, median 0.366, max 0.888) and the ranking moves: USDD is now
-rank 1, Veda 2, Steakhouse 3. Verdicts shift to 23 FARM / 96 MARGINAL /
-82 SKIP (v2: 18 / 171 / 12) — the v2 odds were too high on average, so
-many marginal farms were flattered; v3 calls more of them SKIP honestly.
-
-## The model (unchanged parts)
-
-**Value model.** ln(mcap/TVL) = −1.275 − 0.404 × (ln TVL − 17), fit on
-the 113 listed comps (the 15 newest listings are held out blind).
-Bigger TVL, smaller multiple (slope −0.404, bootstrap SE 0.081, 95% CI
-[−0.561, −0.239]). Steakhouse Financial (TVL $2.75B): if-listing value
-$113.7M (v2: $62.1M — the value model is the same; the difference is the
-snapshot's TVL, not the fit).
+**Token odds.** Logistic, fit on all 758 protocols, 5-fold CV (folds by
+index mod 5, category rate computed in-fold). Features [1, ln TVL − 17,
+growth/10 (clip ±50), family size, category rate − base rate, post2024].
+Coefficients: intercept −0.558, ln TVL 0.113, growth −0.185, family 1.365,
+category 3.873, post2024 −1.447. **CV Brier 0.1965** (folds 0.2044, 0.1672,
+0.2087, 0.1984, 0.2036) vs base 0.2476. In-sample Brier 0.1736. The v3
+dated/age terms are removed — the regime flag absorbs the age/cohort
+signal (0.1969 → 0.1965 without them). The flag is a calendar feature,
+not age: the cut stays 2024-05-17 on the final snapshot.
 
 **Term-by-term, each tested twice (median |log error|):** only the size
-curve survives both tests (LOO ×3.33, WF ×2.53 vs flat ×4.75 / ×5.22).
-Category, family, growth, age, chain count and the placebo (name length)
-all fail at least one test. Full table is in fit.json.
+curve + famTVL survives both tests. Category, family size (a 2-point
+artifact: aave-v2 and sushiswap only), growth in the value curve (WF
+improves 0.929 → 0.785 but its shipped coefficient is +0.05 ± 0.47 and it
+destroys rank stability — top-10 bootstrap spread 5.8 → 25.5), age,
+chains, and rel-to-category-median all fail at least one test or were
+rejected with numbers. Full table is in fit.json.
 
 **Evidence.** Honesty: 50.4% of true caps fall inside the printed
 P25–P75 range (leave-one-out) — exactly what a P25–P75 interval should
 cover. Blind holdout (15 newest listings, never used to fit): size-curve
-miss ×5.25 vs flat ×6.65; excluding the 6 extreme-ratio comps, ×3.93.
-Top-10 ranks are stable across 200 bootstrap refits: ranks 1–6 never
-move.
+miss ×4.98 vs flat ×6.20; excluding the 6 extreme-ratio comps, ×3.82.
+Top-10 ranks are stable across 200 bootstrap refits (mean spread ~6.5).
 
 **Farm verdicts.** Deposit = max($10,000, 0.02% of TVL). Airdrop pool
 = 7% of if-listing value; your share = deposit / 10% of TVL, times token
 odds. Fees 6% APR, gas $12/week, T-bill 4.5% APR, 12-week horizon,
 2 h/week. FARM needs net >= $2,000 and >= $50/hour; SKIP is net <= $0 or
-under $25/hour.
+under $25/hour. Verdicts: 14 FARM / 98 MARGINAL / 89 SKIP.
+
+**Board.** 201 ranked rows (USDD #1 at $27.13M implied, odds 0.414);
+board implied total $755,421,292; board odds min 0.035, median 0.354,
+max 0.885, mean 0.364. Ledger: 201 ranked / 416 listed / 141 excluded /
+758 total; watchlist 40/40.
 
 **KPI strip + integrity strip.** Six headline numbers on top; all 758
-protocols accounted for (201 ranked, 416 already record a token, 141
-excluded by the house-style rule). The dashboard recomputes every implied
-value, farm number and verdict in the browser and checks them against the
+protocols accounted for. The dashboard recomputes every implied value,
+farm number and verdict in the browser and checks them against the
 shipped board. Checksum = main.ts.
 
 ## Files
@@ -86,32 +74,39 @@ shipped board. Checksum = main.ts.
   writes `/output/dossier.json` via the kit's `vendor/makefun-board.ts`.
 - `fit.json` — fitted coefficients, 200 bootstrap refits, validation
   numbers, ledger, farm assumptions. Computed by the local analysis tool
-  (`analyze_v3.py`, not part of the entry).
+  (`analysis/analyze_v4.py`, not part of the entry).
 - `dashboard/` — index.html, app.css, app.js (renders `data.js`; the farm
   step template is identical to main.ts).
 - `screenshots/` — 1-board, 2-detail, 3-filtered (1440x900 PNG, rendered
-  with PIL from the real board data by `render_shots_v3.py`).
+  with PIL from the real board data by `analysis/render_shots.py`).
 
 ## Verification
 
 - Determinism: two local runs produce byte-identical `/output`.
 - main.ts reproduces the analysis board exactly (0 mismatches on all 201
   rows: implied, odds, if-listing, P25/P75, verdict, net, rank).
-- Gate simulation: all 7 scorer rows pass (dashboard_files, board_file,
-  sorted_by_value, coverage, farm_steps, screenshots, dossier_matches by
-  construction).
+- Gate check (local, kit60 CLI): see TEST-REPORT.md.
 
 ## Honest limits
 
-- The value model explains little (R2 0.19): mcap/TVL varies enormously,
-  so the typical miss is still ×3.33 leave-one-out. The numbers are what
-  they are; the dashboard prints them rather than hiding them.
-- Token odds are better now (Brier 0.2045 vs base 0.2476) but still far
-  from sharp: the board odds average 0.378 against a 0.549 base rate.
-- The blind holdout miss (×5.25) is worse than leave-one-out (×3.33)
+- The value model explains little (R² 0.145): mcap/TVL varies enormously,
+  so the typical miss is still ×3.26 leave-one-out, ×4.98 on the blind
+  holdout. The numbers are what they are; the dashboard prints them
+  rather than hiding them.
+- Token odds are better now (Brier 0.1965 vs base 0.2476) but still far
+  from sharp: the board odds average 0.364 against a 0.549 base rate.
+- The blind holdout miss (×4.98) is worse than leave-one-out (×3.26)
   because 6 of the 15 newest listings have extreme ratios.
 - The odds model is censored: protocols that have not listed yet but will
-  later are labelled 0, so odds are a lower bound on P(ever lists).
+  later are labelled 0, so odds are a lower bound on P(ever lists) — and
+  the regime reading of the age gradient is one untestable assumption:
+  if post-2024 is only slow exposure, board odds are too low.
+- Honesty is uneven by size (small 67% / mid 43% / large 50% coverage);
+  a heteroskedastic interval did not fix it.
+- The v4-over-v3 gain is small statistically: only the Brier gain is
+  solid (paired CI excludes 0). v4 is v3 + one flag + one measurement
+  fix, not a leap — expect a small dev move, not a jump.
 - fit.json is frozen from the 2026-11-14 snapshot. The final snapshot
-  (14 Dec) will differ; a refit on the freshest snapshot before submit
-  is still advisable if the kit ships a newer one.
+  (14 Dec) will differ; refit on the freshest snapshot before submit
+  (run `analysis/analyze_v4.py` on it — coefficients change; the regime
+  cut, family-TVL rule and farm math do not).
