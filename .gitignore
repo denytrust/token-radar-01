@@ -1,5 +1,8 @@
 out/
 out2/
+DOSSIER.md
+analysis/
+TEST-REPORT.md
+prompt.txt
 transcripts.tar.gz
-*.py
-board_rows.json
+usage-*.jsonl
