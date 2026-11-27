@@ -1,12 +1,109 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Launch Radar v3 — token-radar-01</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token Radar v4 — Launch Radar</title>
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
-<div id="app"></div>
+<header class="top">
+  <div>
+    <h1>Token Radar <span class="v">v4</span></h1>
+    <p class="sub">Which pre-token protocol is worth farming next — ranked by what its launch would be worth, with the costed plan for each one. Snapshot 14 Nov 2026, 758 protocols.</p>
+  </div>
+  <div class="model-note">Value: ln(mcap/TVL) = −1.3177 − 0.3868·(ln TVL − 17) · Odds: logistic + post-2024 flag · R² 0.145 — miss numbers printed, not hidden.</div>
+</header>
+
+<section class="kpis" id="kpis" aria-label="Validation numbers"></section>
+<section class="integrity" id="integrity" aria-label="Integrity check"></section>
+
+<section class="controls">
+  <input id="search" type="search" placeholder="Search protocol or category…" aria-label="Search">
+  <div class="verdicts" id="verdictFilters">
+    <button data-v="ALL" class="on">All 201</button>
+    <button data-v="FARM">FARM</button>
+    <button data-v="MARGINAL">MARGINAL</button>
+    <button data-v="SKIP">SKIP</button>
+  </div>
+  <label class="chk"><input type="checkbox" id="watchOnly"> Watchlist only</label>
+  <select id="catFilter" aria-label="Category filter"><option value="">All categories</option></select>
+  <div class="sliders">
+    <label>Plan size <input type="range" id="sizeMul" min="0.25" max="4" step="0.25" value="1"> <b id="sizeMulVal">1.00× deposit</b></label>
+    <label>Drop share <input type="range" id="dropShare" min="1" max="15" step="0.5" value="7"> <b id="dropShareVal">7.0%</b></label>
+    <label>Horizon <input type="range" id="weeks" min="4" max="26" step="1" value="12"> <b id="weeksVal">12 weeks</b></label>
+  </div>
+  <p class="slider-note">Sliders re-price every farm plan live. At the defaults (1×, 7%, 12 weeks) the recomputed numbers must match the shipped board — the integrity strip says whether they do.</p>
+</section>
+
+<main>
+  <section class="board-wrap">
+    <table id="board">
+      <thead><tr>
+        <th data-k="rank">#</th><th data-k="name">Protocol</th><th data-k="tvl">TVL</th>
+        <th data-k="odds">Token odds</th><th data-k="if">If it launches</th>
+        <th data-k="implied">Implied · P25–P75</th><th data-k="verdict">Verdict · net of fees</th>
+        <th data-k="neth">Net/hour</th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <p class="count" id="count"></p>
+  </section>
+
+  <section class="detail" id="detail" hidden>
+    <h2 id="dTitle"></h2>
+    <div id="dMeta"></div>
+    <div class="dgrid">
+      <div>
+        <h3>Farm plan — 10 steps, costed</h3>
+        <ol id="dSteps"></ol>
+        <p class="exit" id="dExit"></p>
+      </div>
+      <div>
+        <h3>Nearest priced peers</h3>
+        <table class="peers" id="dPeers"></table>
+        <h3>Recomputed vs shipped</h3>
+        <table class="peers" id="dCheck"></table>
+      </div>
+    </div>
+  </section>
+
+  <section class="evidence">
+    <h2>Evidence — every claim, out of sample</h2>
+    <div class="egrid">
+      <div>
+        <h3>Value model (median |log error|)</h3>
+        <table id="valTable"></table>
+        <p class="fine">LOO and walk-forward are refits on the 113 listed comps; the blind holdout is the 15 newest listings, never used to fit. Flat = predicting the median ratio for every protocol.</p>
+      </div>
+      <div>
+        <h3>Terms tested — only the size curve survives both tests</h3>
+        <table id="termTable"></table>
+        <p class="fine">Growth in the value curve and the family-size term were tested and rejected with numbers (see Honest limits). Growth and age still enter the implied value — growth through the odds, age through the regime flag.</p>
+      </div>
+    </div>
+    <h3>Token odds</h3>
+    <p id="oddsText"></p>
+  </section>
+
+  <section class="limits">
+    <h2>Honest limits — read before you farm</h2>
+    <ol>
+      <li><b>The value model is weak in absolute terms.</b> R² 0.145; typical miss ×3.26 leave-one-out, ×4.98 blind holdout. mcap/TVL spans 8 orders of magnitude; no snapshot variable explains more.</li>
+      <li><b>The P25–P75 interval is not evenly honest by size:</b> 67% coverage for small protocols, 43% for mid-size, 50% for large. A heteroskedastic interval was tried and did not fix it.</li>
+    <li><b>The sensor correction rests on one untestable assumption.</b> In one snapshot, age and cohort are the same variable. v4 reads the age gradient as a calendar cliff (May 2024): pre-2024 cohorts list at ~0.78, post-2024 at ~0.37. A one-regime survival correction would inflate board odds to 0.545; it was rejected with evidence. If post-2024 is only slow exposure, our odds are too low.</li>
+      <li><b>The growth effect in the value model has decayed to zero</b> (full-sample +0.05 ± 0.47). It improved early-era walk-forward but destroyed rank stability, so it is not shipped.</li>
+      <li><b>Holdout is only 15 comps, 6 extreme</b> (rain 400×, obol 0.0006×). One comp crossing the median moves ×4.98 materially; ex-extreme ×3.82.</li>
+      <li><b>v4 over v3 is small, statistically.</b> LOO (+0.021) and holdout (+0.053) gains sit inside bootstrap noise; only the Brier gain is solid (paired 90% CI excludes 0). v3 + one flag + one fix — not a leap.</li>
+      <li><b>Snapshot frozen 14 Nov 2026.</b> If the final kit ships a newer snapshot, every number here must be refit; the specification (regime cut, family-TVL rule, farm math) does not change.</li>
+    </ol>
+    <p class="fine">A protocol “records no token” in DefiLlama — that is the record, not proof it has none. Implied values are this entry’s own claim, never make.fun’s. Nothing here is financial advice.</p>
+  </section>
+</main>
+
+<footer>
+  <p>Token Radar v4 · 201 ranked · 416 record a token · 141 excluded · 758 accounted for · Checksum recomputed in your browser.</p>
+</footer>
 <script src="data.js"></script>
 <script src="app.js"></script>
 </body>

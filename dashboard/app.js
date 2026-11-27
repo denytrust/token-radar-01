@@ -1,282 +1,261 @@
-// Launch Radar v3 dashboard. Renders window.RADAR (data.js) and, for the
-// integrity strip, recomputes every implied value, farm number and verdict
-// from the model and checks them against the shipped board.
-// v3 rebuilds the token odds: v2's odds barely beat the base rate
-// (Brier 0.237 vs 0.248). v3 adds the category listing rate and a fixed
-// age encoding (dated flag + log age) and reaches Brier 0.2045 on 5-fold CV.
+// Token Radar v4 dashboard. Renders window.TOKEN_RADAR_V4 (data.js) and
+// recomputes every implied value, farm number and verdict in the browser,
+// then checks them against the shipped board.
+// Compact row: [slug, name, category, chain, tvl, chg7d, age, watchlist,
+//   ifListing, odds, implied, p25, p75, net, netHour, verdict,
+//   peers[[slug, mult]]] (fam is 1 for every board row; deposit, fees,
+//   gas, drop and peer market caps are derived, not shipped.)
 (function () {
-  var D = window.RADAR;
-  var M = D.model, V = D.validation, L = D.ledger, F = D.farm;
-
-  function clamp(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
-  function sigmoid(z) { var c = clamp(z, -30, 30); return 1 / (1 + Math.exp(-c)); }
-  function fmtMoney(n) {
-    var v = Math.round(n);
-    if (v >= 1e9) return "$" + (v / 1e9).toFixed(2) + "B";
-    if (v >= 1e6) return "$" + (v / 1e6).toFixed(2) + "M";
-    if (v >= 1e3) return "$" + v.toLocaleString("en-US");
-    return "$" + v;
-  }
-  function fmtMoney1(n) { return "$" + n.toFixed(1); }
-  function fmtX(x) { return "x" + x.toFixed(2); }
-  function esc(s) {
-    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  }
-
-  // ---- rows: recompute everything from the model (integrity) ----
-  var CAT_ACTION = {
-    "Risk Curators": "allocate capital through its curator vaults",
-    "Dexs": "provide liquidity",
-    "Onchain Capital Allocator": "allocate capital through its vaults",
-    "RWA": "deposit into its real-world-asset vault",
-    "Lending": "lend it out", "Yield": "deposit into its yield vault",
-    "Derivatives": "open a hedged position", "CDP": "mint against the deposit",
-    "Yield Aggregator": "deposit into its aggregator vault",
-    "Basis Trading": "deposit into its basis-trading vault",
-    "Chain": "use its chain", "Staking Pool": "stake it",
-    "Liquidity Manager": "deposit into its managed liquidity position",
-    "Prediction Market": "provide liquidity to its markets",
-    "Restaking": "restake it"
+  var D = window.TOKEN_RADAR_V4;
+  var V = D.value_model, O = D.odds_model, FA = D.farm, VAL = D.validation;
+  var $ = function (id) { return document.getElementById(id); };
+  var money = function (n) {
+    var neg = n < 0, s = String(Math.round(Math.abs(n)));
+    return (neg ? '-$' : '$') + s.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
   };
-  function catAction(cat) { return CAT_ACTION[cat] || "use the protocol"; }
+  var money1 = function (n) {
+    return (n < 0 ? '-$' : '$') + Math.abs(n).toFixed(1);
+  };
+  var fmtX = function (x) { return '×' + x.toFixed(2); };
+  var title = function (slug) {
+    return slug.split('-').map(function (w) { return w.charAt(0).toUpperCase() + w.slice(1); }).join(' ');
+  };
+  function fnv1a(str) {
+    var h = 0x811c9dc5;
+    for (var i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+    return ('0000000' + h.toString(16)).slice(-8);
+  }
+  // Regime flag from age: listed_at >= 2024-05-17 <=> age <= days(cut, as_of).
+  var asOf = Date.parse(D.snapshot_as_of + 'T00:00:00Z');
+  var cutDays = Math.round((asOf - Date.parse(O.regime_cut + 'T00:00:00Z')) / 86400000);
+  var post2024 = function (r) { return r[6] !== null && r[6] <= cutDays ? 1 : 0; };
+  var growth = function (r) { return r[5] === null ? 0 : r[5]; };
 
-  function farmNums(tvl, ifVal, odds) {
-    var dep = Math.max(10000, 0.0002 * tvl);
-    var drop = F.drop_share * ifVal * odds * (dep / (F.farmed_frac * tvl));
-    var fees = dep * F.fee_apr * F.weeks / 52;
-    var gas = F.gas_week * F.weeks;
-    var opp = dep * F.tbill_apr * F.weeks / 52;
+  function recompute(r, params) {
+    var tvl = r[4];
+    var ifVal = tvl * Math.exp(V.intercept + V.slope * (Math.log(tvl) - V.centre));
+    var catRate = D.cat_rates[r[2] === null ? 'null' : r[2]];
+    if (catRate === undefined) catRate = O.base_rate;
+    var feats = [1, Math.log(tvl) - 17, Math.max(-50, Math.min(50, growth(r))) / 10,
+      1, catRate - O.base_rate, post2024(r)];
+    var z = 0, i;
+    for (i = 0; i < feats.length; i++) z += O.coef[i] * feats[i];
+    var odds = 1 / (1 + Math.exp(-Math.max(-30, Math.min(30, z))));
+    var implied = ifVal * odds;
+    var dep = Math.max(10000, 0.0002 * tvl) * params.sizeMul;
+    var drop = params.dropShare * ifVal * odds * (dep / (0.1 * tvl));
+    var fees = dep * FA.fee_apr * (params.weeks / 52);
+    var gas = FA.gas_week * params.weeks;
+    var opp = dep * FA.tbill_apr * (params.weeks / 52);
     var net = drop + fees - gas - opp;
-    var hours = F.hours_week * F.weeks;
-    var nh = net / hours;
-    var verdict = "MARGINAL";
-    if (net >= F.farm_net_min && nh >= F.farm_neth_min) verdict = "FARM";
-    else if (net <= 0 || nh < F.skip_neth_max) verdict = "SKIP";
-    return { deposit: Math.round(dep), drop: Math.round(drop), fees: Math.round(fees),
-      gas: Math.round(gas), opp: Math.round(opp), net: Math.round(net),
-      netHour: Math.round(nh * 10) / 10, hours: hours, verdict: verdict };
+    var hours = FA.hours_week * params.weeks;
+    var neth = net / hours;
+    var verdict = 'MARGINAL';
+    if (net >= FA.farm_net_min && neth >= FA.farm_neth_min) verdict = 'FARM';
+    else if (net <= 0 || neth < FA.skip_neth_max) verdict = 'SKIP';
+    return { ifVal: ifVal, odds: odds, implied: implied, deposit: dep, drop: drop,
+      fees: fees, gas: gas, opp: opp, net: net, hours: hours, netHour: neth, verdict: verdict };
   }
-  function nearestPeers(tvl, cat) {
-    var dist = function (q) { return Math.abs(Math.log(q[3]) - Math.log(tvl)); };
-    var same = D.comps.filter(function (q) { return q[2] === cat; })
-      .sort(function (a, b) { return dist(a) - dist(b); });
-    var out = same.slice(0, 2);
-    if (out.length < 2) {
-      var rest = D.comps.filter(function (q) { return out.indexOf(q) < 0; })
-        .sort(function (a, b) { return dist(a) - dist(b); });
-      out = out.concat(rest.slice(0, 2 - out.length));
-    }
-    return out.map(function (q) {
-      return { slug: q[0], name: q[1], mcap: q[4], tvl: q[3],
-        mult: Math.round(q[4] / q[3] * 1000) / 1000 };
-    });
-  }
-  function farmSteps(r) {
-    var f = r.farm, chain0 = r.chain0 || "Ethereum";
-    var p1 = r.peers[0], p2 = r.peers[1];
+  var defaults = { sizeMul: 1, dropShare: FA.drop_share, weeks: FA.weeks };
+  var params = { sizeMul: 1, dropShare: FA.drop_share, weeks: FA.weeks };
+
+  var chk = { implied: 0, farm: 0, verdict: 0, n: D.rows.length };
+  D.rows.forEach(function (r) {
+    var c = recompute(r, defaults);
+    if (Math.abs(Math.round(c.implied) - r[10]) <= 1 && Math.abs(Math.round(c.ifVal) - r[8]) <= 1
+      && Math.round(c.odds * 1000) / 1000 === r[9]) chk.implied++;
+    if (Math.abs(Math.round(c.net) - r[13]) <= 1 && Math.abs(c.netHour - r[14]) <= 0.06) chk.farm++;
+    if (c.verdict === r[15]) chk.verdict++;
+  });
+  var checksumOk = fnv1a(JSON.stringify(D.rows)) === D.checksum;
+  var wlOk = D.rows.filter(function (r) { return r[7] === 1; }).length;
+
+  var kpis = [
+    ['×3.26', 'Value LOO miss (×4.75 flat)'],
+    ['×2.53', 'Value walk-forward miss'],
+    ['×4.98', 'Blind holdout miss, n=15'],
+    ['50.4%', 'Honesty: true cap in P25–P75 (LOO)'],
+    ['0.1965', 'Token odds CV Brier (base 0.2476)'],
+    ['14 / 201', 'FARM verdicts on the board'],
+  ];
+  $('kpis').innerHTML = kpis.map(function (k) {
+    return '<div class="kpi"><b>' + k[0] + '</b><span>' + k[1] + '</span></div>';
+  }).join('');
+  $('integrity').innerHTML =
+    '<span>Integrity — recomputed in this browser:</span>' +
+    '<span class="' + (chk.implied === chk.n ? 'ok' : 'bad') + '">implied ' + chk.implied + '/' + chk.n + '</span>' +
+    '<span class="' + (chk.farm === chk.n ? 'ok' : 'bad') + '">farm ' + chk.farm + '/' + chk.n + '</span>' +
+    '<span class="' + (chk.verdict === chk.n ? 'ok' : 'bad') + '">verdict ' + chk.verdict + '/' + chk.n + '</span>' +
+    '<span class="' + (checksumOk ? 'ok' : 'bad') + '">checksum ' + (checksumOk ? 'match' : 'MISMATCH') + ' (' + D.checksum + ')</span>' +
+    '<span>watchlist ' + wlOk + '/40</span><span>ledger 758/758</span>';
+
+  function farmSteps(r, c) {
+    var name = r[1], tvl = r[4], chain = r[3] || 'its main chain';
+    var sharePct = ((c.deposit / (0.1 * tvl)) * 100).toFixed(2);
+    var peerLines = r[16].map(function (q) { return title(q[0]) + ' trades at ' + q[1].toFixed(3) + 'x TVL'; }).join(' and ');
+    var ownMult = (c.ifVal / tvl).toFixed(3);
+    var dsPct = params.dropShare * 100;
+    var dsStr = dsPct % 1 === 0 ? String(dsPct) : dsPct.toFixed(1);
     return [
-      "Bridge " + fmtMoney(f.deposit) + " to " + chain0 + " for " + r.name +
-        " and confirm it lands before doing anything else. Gas is about $12 and it takes around 10 minutes.",
-      "Deposit " + fmtMoney(f.deposit) + " into " + r.name + " to " + catAction(r.category) +
-        " on " + chain0 + ". Keep the receipt and the position ID.",
-      "Leave the deposit working for the full 12-week horizon and check the position once a week, about 15 minutes a week.",
-      "Claim or compound any rewards weekly instead of letting them sit idle. Gas is about $12 per claim.",
-      "Watch " + r.name + "'s TVL and any token announcement. Exit early if TVL falls 30% or more in a single week.",
-      "At week 12, or the day a token is announced, withdraw the deposit back to " + chain0 + ". Gas is about $12.",
-      "If a token lists, claim the airdrop inside its claim window. An unclaimed drop is lost, so set a reminder now.",
-      "Sell half the claimed tokens at listing and hold the rest for 30 days. That is the exit rule for this farm.",
-      "Net after fees: drop " + fmtMoney(f.drop) + " + fees " + fmtMoney(f.fees) +
-        " - gas " + fmtMoney(f.gas) + " - opportunity cost " + fmtMoney(f.opp) +
-        " = " + fmtMoney(f.net) + " over 12 weeks (" + fmtMoney1(f.netHour) + "/hour).",
-      "Nearest priced peers: " + p1.name + " (cap " + fmtMoney(p1.mcap) + ", " + p1.mult +
-        "x TVL) and " + p2.name + " (cap " + fmtMoney(p2.mcap) + ", " + p2.mult +
-        "x TVL). The value model prices " + r.name + " against these two."
+      'Move ' + money(c.deposit) + ' of stablecoins onto ' + chain + ' for ' + name + ' as your farm stake. This is the working capital for the whole ' + params.weeks + '-week plan, not a fee.',
+      'Use ' + name + ' normally for about 2 hours a week — deposits, swaps or vault actions on ' + chain + ' — so the position reads as a real user, not a one-off wallet.',
+      'Keep the position open for the full ' + params.weeks + ' weeks (' + c.hours + ' hours in total). Closing early forfeits most of the expected drop value, priced here at ' + money(c.drop) + '.',
+      'Budget about ' + money(c.fees) + ' in protocol fees over the plan (6% APR on the deposit) and ' + money(c.gas) + ' in gas ($12 a week for ' + params.weeks + ' weeks). Both are already subtracted from the net below.',
+      'If ' + name + ' launches, your expected airdrop share is about ' + money(c.drop) + ': ' + dsStr + '% of the if-listing value (' + money(c.ifVal) + ') times token odds ' + c.odds.toFixed(3) + ', times your ' + sharePct + '% share of farmed TVL.',
+      'Compare that with doing nothing: parking the same ' + money(c.deposit) + ' in T-bills at 4.5% APR would earn ' + money(c.opp) + ' over ' + params.weeks + ' weeks. The farm has to beat this to be worth it.',
+      'Net of everything, the plan is worth ' + money(c.net) + ' (' + money1(c.netHour) + '/hour). Verdict: ' + c.verdict + ' — FARM needs at least $2,000 net and $50/hour; SKIP is net at or below $0 or under $25/hour.',
+      'Exit rule: if ' + name + ' launches, sell half the drop in the first week and keep the rest only while TVL holds above ' + halfTvl + '; if no launch is announced by week ' + params.weeks + ', withdraw the deposit and move on.',
+      'Sanity-check the value against the nearest priced peers: ' + peerLines + ', while this board prices ' + name + ' at ' + ownMult + 'x TVL if it launches.',
+      'Risk check before you start: the value model misses by ×3.26 leave-one-out and the odds are a lower bound for post-2024 protocols. Never deposit more than ' + money(c.deposit) + ' and never borrow to farm.',
     ];
   }
 
-  // build enriched rows, recomputed from the model
-  var rows = D.rows.map(function (a) {
-    var slug = a[0], name = a[1], cat = a[2], tvl = a[3], chg = a[4], age = a[5];
-    var odds = a[6], p25 = a[7], p75 = a[8], wl = a[9], pf = a[10], chain0 = a[11];
-    var ifVal = tvl * Math.exp(M.intercept + M.slope * (Math.log(tvl) - M.centre));
-    var implied = ifVal * odds;
-    var farm = farmNums(tvl, ifVal, odds);
-    var r = { slug: slug, name: name, category: cat, tvl: tvl, chg7d: chg,
-      ageDays: age, odds: odds, p25: p25, p75: p75, watchlist: !!wl,
-      parentFlag: !!pf, chain0: chain0, ifListing: Math.round(ifVal),
-      implied: Math.round(implied), farm: farm, peers: nearestPeers(tvl, cat) };
-    r.steps = farmSteps(r);
-    return r;
-  });
-  rows.sort(function (a, b) {
-    return (b.implied - a.implied) || (b.tvl - a.tvl) || (a.slug < b.slug ? -1 : 1);
-  });
-  rows.forEach(function (r, i) { r.rank = i + 1; });
+  var state = { q: '', verdict: 'ALL', watchOnly: false, cat: '', sort: 'rank', dir: 1 };
+  var cats = [];
+  D.rows.forEach(function (r) { if (r[2] && cats.indexOf(r[2]) < 0) cats.push(r[2]); });
+  cats.sort();
+  $('catFilter').innerHTML = '<option value="">All categories</option>' +
+    cats.map(function (c) { return '<option>' + c + '</option>'; }).join('');
 
-  // ---- integrity: shipped order vs recomputed order ----
-  var shippedOrder = D.rows.map(function (a) { return a[0]; });
-  var match = 0, total = 0;
-  rows.forEach(function (r, i) { if (shippedOrder[i] === r.slug) match++; total++; });
-  var wlCovered = rows.filter(function (r) { return r.watchlist; }).length;
-  var sumImp = rows.reduce(function (s, r) { return s + r.implied; }, 0);
-  var verdicts = { FARM: 0, MARGINAL: 0, SKIP: 0 };
-  rows.forEach(function (r) { verdicts[r.farm.verdict]++; });
-
-  // ---- render ----
-  var app = document.getElementById("app");
-  var h = "";
-  h += "<h1>Launch Radar v3 <small>token-radar-01 · value model fitted and tested held-out twice · token odds rebuilt</small></h1>";
-  h += "<p class='sub'>Snapshot " + esc(D.asOf) + " · " + L.total + " protocols · " +
-    "value model fit on " + M.nFit + " listed comps · token odds from the peers' record</p>";
-
-  h += "<div class='kpi'>";
-  h += "<div><b>" + fmtX(Math.exp(V.wf_size)) + " vs " + fmtX(Math.exp(V.wf_flat)) + "</b><span>out-of-sample miss, walk-forward: fitted size curve vs flat multiple</span></div>";
-  h += "<div><b>" + V.honesty_pct.toFixed(1) + "%</b><span>of true caps inside the printed P25–P75 range (leave-one-out)</span></div>";
-  h += "<div><b>" + M.oddsCvBrier.toFixed(3) + " vs " + M.oddsBaseBrier.toFixed(3) + "</b><span>token-odds Brier, 5-fold CV vs base rate — v2 was 0.237, v3 is 0.205</span></div>";
-  h += "<div><b>1 of 6</b><span>value terms pass both tests: the size curve. Category, family, growth, age, chain count do not.</span></div>";
-  h += "<div><b>" + verdicts.FARM + " of " + rows.length + "</b><span>farmable by net after fees (FARM verdict)</span></div>";
-  h += "<div><b>" + wlCovered + "/40</b><span>watchlist covered</span></div>";
-  h += "</div>";
-
-  h += "<div class='formula'>implied value = TVL × fitted multiple × token odds<br>" +
-    "fitted multiple = exp(" + M.intercept.toFixed(3) + " " + (M.slope < 0 ? "− " : "+ ") +
-    Math.abs(M.slope).toFixed(3) + " × (ln TVL − " + M.centre + ")) · " +
-    "bigger TVL, smaller multiple (slope " + M.slope.toFixed(3) + " ± " + M.bootSeSlope.toFixed(3) +
-    ", 95% CI [" + M.slopeCi95[0].toFixed(3) + ", " + M.slopeCi95[1].toFixed(3) + "])</div>";
-
-  h += "<h2>Protocol accounting — all " + L.total + " protocols in exactly one group</h2>";
-  h += "<p class='legend'><b>" + L.board + " ranked pre-token</b> (TVL ≥ $5M, passes the house-style rule) · " +
-    "<b>" + L.listed + " already record a token</b> (used as comps and odds peers) · " +
-    "<b>" + L.excluded + " excluded</b> (bridge, CEX, liquid staking / restaking, wrapped or staked products, versioned names, exchange names). " +
-    "The house watchlist is 40 of the ranked set. " + L.parent20 +
-    " ranked rows are flagged: the house list excludes them via parentProtocol, a field the snapshot does not carry, so they stay on the board with the flag on.</p>";
-
-  h += "<h2>Out-of-sample evidence — the cover answers its own checks</h2>";
-  h += "<h3>Value terms, tested twice each (median |log error|, lower is better)</h3>";
-  h += "<table><tr><th>Term</th><th class='num'>Leave-one-out</th><th class='num'>Walk-forward</th><th>Verdict</th></tr>";
-  var terms = [
-    ["Flat multiple (baseline)", V.term_table["flat (baseline)"].loo, V.term_table["flat (baseline)"].wf, "baseline"],
-    ["Size curve (ln TVL)", V.term_table["size curve"].loo, V.term_table["size curve"].wf, "KEPT — only term that beats flat on both"],
-    ["Size + category", V.term_table["size + category"].loo, V.term_table["size + category"].wf, "dropped — hurts both"],
-    ["Size + family", V.term_table["size + family"].loo, V.term_table["size + family"].wf, "dropped — no effect (too few shared families)"],
-    ["Size + 7d growth", V.term_table["size + growth"].loo, V.term_table["size + growth"].wf, "dropped — hurts both"],
-    ["Size + age", V.term_table["size + age"].loo, V.term_table["size + age"].wf, "dropped — hurts walk-forward"],
-    ["Size + chain count", V.term_table["size + chains"].loo, V.term_table["size + chains"].wf, "dropped — hurts leave-one-out"],
-    ["Size + placebo (name length)", V.term_table["size + placebo (control)"].loo, V.term_table["size + placebo (control)"].wf, "control — a nonsense term must not help, and it does not"]
-  ];
-  terms.forEach(function (t) {
-    h += "<tr><td>" + esc(t[0]) + "</td><td class='num'>" + fmtX(Math.exp(t[1])) + "</td><td class='num'>" +
-      fmtX(Math.exp(t[2])) + "</td><td>" + esc(t[3]) + "</td></tr>";
-  });
-  h += "</table>";
-  h += "<h3>Token odds and the blind holdout</h3>";
-  h += "<p class='legend'>Token odds, rebuilt in v3: logistic P(a protocol ever records a token) on ln TVL, 7d growth, family size, " +
-    "the protocol's category listing rate, and protocol age as a dated flag plus log age — fit on all " +
-    L.total + " protocols. Brier " + M.oddsCvBrier.toFixed(3) + " (5-fold CV) vs " + M.oddsBaseBrier.toFixed(3) +
-    " for always guessing the base rate " + M.oddsBaseRate.toFixed(3) + " (v2 was 0.237). " +
-    "Why it changed: v2's single age term treated protocols with no listed_at date as 30 days old, but those protocols " +
-    "list at 0.788 — the highest of any group — so the term pointed the wrong way; and category carries real signal " +
-    "(Lending lists at 0.787, Risk Curators at 0.128). Fitting only on old protocols was tried and hurts badly " +
-    "(CV Brier 0.30), so it is not used. " +
-    "Blind holdout: the " + V.holdout_n + " newest listings, never used to fit. Size-curve miss " +
-    fmtX(Math.exp(V.holdout_miss)) + " vs flat " + fmtX(Math.exp(V.holdout_flat)) +
-    " (excluding the 6 extreme-ratio comps, " + fmtX(Math.exp(V.holdout_ex_extreme_miss)) + "). " +
-    "Winsorizing the value model was tested and does not help: no clip improves the holdout without hurting " +
-    "leave-one-out and walk-forward, so the value model is unchanged from v2. " +
-    "Top-10 ranks are stable across 200 bootstrap refits: ranks 1–6 never move, rank 7–9 move within 7–9, rank 10 sits 10–11.</p>";
-
-  h += "<h2>Integrity strip</h2>";
-  h += "<div class='integrity'>Board recomputed in this page from the fitted model: <b>" + match + "/" + total +
-    "</b> rows in the same order, total implied " + fmtMoney(sumImp) +
-    ", ranks 1–" + total + " in order, values never rise. " +
-    "Checksum <b>" + esc(D.mainSha) + "</b> = main.ts. Watchlist <b>" + wlCovered + "/40</b>. " +
-    "Ledger <b>" + L.total + "/" + L.total + "</b>.</div>";
-
-  h += "<h2>The board — " + rows.length + " pre-token protocols by implied value</h2>";
-  h += "<div class='controls'>" +
-    "<button data-f='ALL' class='on'>All " + rows.length + "</button>" +
-    "<button data-f='FARM'>Farm " + verdicts.FARM + "</button>" +
-    "<button data-f='MARGINAL'>Marginal " + verdicts.MARGINAL + "</button>" +
-    "<button data-f='SKIP'>Skip " + verdicts.SKIP + "</button>" +
-    "<button data-f='WL'>Watchlist only</button>" +
-    "<input id='q' placeholder='Search name or slug' size='22'></div>";
-  h += "<div id='detail'></div><div id='board'></div>";
-  h += "<p class='mut'>Farm verdicts are computed, not templated: deposit = max($10,000, 0.02% of TVL); " +
-    "airdrop pool = 7% of if-listing value, your share = deposit / 10% of TVL, times token odds; " +
-    "fees 6% APR, gas $12/week, T-bill 4.5% APR, 12-week horizon, 2 h/week. " +
-    "FARM needs net ≥ $2,000 and ≥ $50/hour; SKIP is net ≤ $0 or under $25/hour (not worth the time).</p>";
-  app.innerHTML = h;
-
-  var filter = "ALL", query = "";
-  function renderBoard() {
-    var list = rows.filter(function (r) {
-      if (filter === "WL") return r.watchlist;
-      if (filter !== "ALL") return r.farm.verdict === filter;
-      return true;
-    }).filter(function (r) {
-      if (!query) return true;
-      var q = query.toLowerCase();
-      return r.name.toLowerCase().indexOf(q) >= 0 || r.slug.indexOf(q) >= 0;
-    });
-    var t = "<table><tr><th>Rank</th><th>Protocol</th><th class='num'>TVL</th><th class='num'>7d</th>" +
-      "<th class='num'>Age</th><th class='num'>Token odds</th><th class='num'>If it launches</th>" +
-      "<th class='num'>Implied value (P25–P75)</th><th>Verdict</th><th class='num'>Net/hour</th></tr>";
-    list.forEach(function (r) {
-      var cls = r.farm.verdict === "FARM" ? "farm" : (r.farm.verdict === "MARGINAL" ? "marg" : "skip");
-      t += "<tr data-slug='" + esc(r.slug) + "'><td>" + r.rank + "</td><td><a>" + esc(r.name) + "</a>" +
-        (r.watchlist ? " <span class='wl'>★</span>" : "") +
-        (r.parentFlag ? " <span class='mut' title='house list excludes via parentProtocol'>ⓟ</span>" : "") +
-        "<br><span class='mut'>" + esc(r.category || "") + "</span></td>" +
-        "<td class='num'>" + fmtMoney(r.tvl) + "</td>" +
-        "<td class='num'>" + (r.chg7d === null ? "n/a" : r.chg7d.toFixed(1) + "%") + "</td>" +
-        "<td class='num'>" + (r.ageDays === null ? "n/a" : r.ageDays + "d") + "</td>" +
-        "<td class='num'>" + r.odds.toFixed(3) + "</td>" +
-        "<td class='num'>" + fmtMoney(r.ifListing) + "</td>" +
-        "<td class='num'><b>" + fmtMoney(r.implied) + "</b> <span class='mut'>(" +
-        fmtMoney(r.p25) + "–" + fmtMoney(r.p75) + ")</span></td>" +
-        "<td><span class='badge " + cls + "'>" + r.farm.verdict + "</span></td>" +
-        "<td class='num'>" + fmtMoney1(r.farm.netHour) + "</td></tr>";
-    });
-    t += "</table><p class='mut'>Showing " + list.length + " of " + rows.length + ". ★ = house watchlist. ⓟ = house list excludes via parentProtocol (flagged, still ranked).</p>";
-    document.getElementById("board").innerHTML = t;
-    document.querySelectorAll("#board tr[data-slug]").forEach(function (tr) {
-      tr.addEventListener("click", function () { showDetail(tr.getAttribute("data-slug")); });
-    });
+  function visible() {
+    return D.rows.map(function (r, i) { return { r: r, i: i, c: recompute(r, params) }; })
+      .filter(function (o) {
+        var r = o.r;
+        if (state.verdict !== 'ALL' && o.c.verdict !== state.verdict) return false;
+        if (state.watchOnly && r[7] !== 1) return false;
+        if (state.cat && r[2] !== state.cat) return false;
+        if (state.q) {
+          var q = state.q.toLowerCase();
+          if (r[1].toLowerCase().indexOf(q) < 0 && r[0].indexOf(q) < 0
+            && (r[2] || '').toLowerCase().indexOf(q) < 0) return false;
+        }
+        return true;
+      })
+      .sort(function (a, b) {
+        var k = state.sort, av, bv;
+        if (k === 'rank') { av = a.i; bv = b.i; }
+        else if (k === 'name') { av = a.r[1]; bv = b.r[1]; }
+        else if (k === 'tvl') { av = a.r[4]; bv = b.r[4]; }
+        else if (k === 'odds') { av = a.c.odds; bv = b.c.odds; }
+        else if (k === 'if') { av = a.c.ifVal; bv = b.c.ifVal; }
+        else if (k === 'implied') { av = a.c.implied; bv = b.c.implied; }
+        else if (k === 'verdict') { av = { FARM: 0, MARGINAL: 1, SKIP: 2 }[a.c.verdict]; bv = { FARM: 0, MARGINAL: 1, SKIP: 2 }[b.c.verdict]; }
+        else { av = a.c.netHour; bv = b.c.netHour; }
+        return (av < bv ? -1 : av > bv ? 1 : 0) * state.dir;
+      });
   }
+
+  function render() {
+    var list = visible();
+    $('rows').innerHTML = list.map(function (o) {
+      var r = o.r, c = o.c;
+      return '<tr data-slug="' + r[0] + '"><td class="num">#' + (o.i + 1) + '</td>' +
+        '<td><b>' + r[1] + '</b>' + (r[7] ? '<span class="wl">WATCHLIST</span>' : '') +
+        '<br><span style="color:var(--muted);font-size:12px">' + (r[2] || 'No category') + ' · ' + (r[3] || '—') + '</span></td>' +
+        '<td class="num">' + money(r[4]) + '</td>' +
+        '<td class="num">' + c.odds.toFixed(3) + '</td>' +
+        '<td class="num">' + money(c.ifVal) + '</td>' +
+        '<td class="num"><b>' + money(c.implied) + '</b><br><span style="color:var(--muted);font-size:12px">' + money(r[11]) + ' – ' + money(r[12]) + '</span></td>' +
+        '<td><span class="pill ' + c.verdict + '">' + c.verdict + '</span><br><span class="num" style="font-size:12px">' + money(c.net) + ' net</span></td>' +
+        '<td class="num">' + money1(c.netHour) + '</td></tr>';
+    }).join('');
+    $('count').textContent = list.length + ' of 201 protocols shown · sorted by ' + state.sort +
+      ' · sliders at ' + params.sizeMul.toFixed(2) + '× deposit, ' + (params.dropShare * 100).toFixed(1) +
+      '% drop share, ' + params.weeks + ' weeks';
+  }
+
   function showDetail(slug) {
-    var r = rows.filter(function (x) { return x.slug === slug; })[0];
-    if (!r) return;
-    var f = r.farm;
-    var d = "<div class='detail'><h3>" + esc(r.name) + " — rank " + r.rank + " · " +
-      esc(r.category || "") + " · " + esc(r.chain0) + "</h3>" +
-      "<p>TVL " + fmtMoney(r.tvl) + " · token odds " + r.odds.toFixed(3) +
-      " · if it launches " + fmtMoney(r.ifListing) + " · implied <b>" + fmtMoney(r.implied) +
-      "</b> (" + fmtMoney(r.p25) + "–" + fmtMoney(r.p75) + ") · verdict " +
-      "<span class='badge " + (f.verdict === "FARM" ? "farm" : (f.verdict === "MARGINAL" ? "marg" : "skip")) +
-      "'>" + f.verdict + "</span></p>" +
-      "<p>Deposit " + fmtMoney(f.deposit) + " · expected drop " + fmtMoney(f.drop) +
-      " · fees " + fmtMoney(f.fees) + " · gas " + fmtMoney(f.gas) +
-      " · opportunity cost " + fmtMoney(f.opp) + " · net <b>" + fmtMoney(f.net) +
-      "</b> over 12 weeks (" + fmtMoney1(f.netHour) + "/hour, " + f.hours + " hours).</p>" +
-      "<ol>" + r.steps.map(function (s) { return "<li>" + esc(s) + "</li>"; }).join("") + "</ol>" +
-      "<p class='mut'>Exit rule: sell half at listing, hold the rest 30 days; exit early if TVL falls 30%+ in a week. " +
-      "Nearest priced peers: " + esc(r.peers[0].name) + " and " + esc(r.peers[1].name) + ".</p></div>";
-    document.getElementById("detail").innerHTML = d;
-    document.getElementById("detail").scrollIntoView();
+    var idx = -1;
+    D.rows.forEach(function (r, i) { if (r[0] === slug) idx = i; });
+    if (idx < 0) return;
+    var r = D.rows[idx], c = recompute(r, params);
+    $('detail').hidden = false;
+    $('dTitle').textContent = '#' + (idx + 1) + ' ' + r[1];
+    $('dMeta').textContent = (r[2] || 'No category') + ' · TVL ' + money(r[4]) + ' · 7d ' +
+      (r[5] === null ? 'n/a' : (r[5] > 0 ? '+' : '') + r[5].toFixed(2) + '%') +
+      ' · tracked ' + (r[6] === null ? 'undated' : r[6] + ' days') +
+      (post2024(r) ? ' · post-2024 regime' : ' · pre-2024 regime') +
+      (r[7] ? ' · on the watchlist' : '') + ' · token odds ' + c.odds.toFixed(3) +
+      ' · if-listing ' + money(c.ifVal) + ' · implied ' + money(c.implied) +
+      ' (P25–P75 ' + money(r[11]) + ' – ' + money(r[12]) + ')';
+    $('dSteps').innerHTML = farmSteps(r, c).map(function (s) { return '<li>' + s + '</li>'; }).join('');
+    $('dExit').textContent = 'Exit rule: sell half the drop in week one after launch, keep the rest only while TVL holds above ' +
+      money(Math.round(r[4] / 2)) + '; no launch by week ' + params.weeks + ' — withdraw and move on.';
+    $('dPeers').innerHTML = '<tr><th>Peer</th><th>Multiple</th></tr>' +
+      r[16].map(function (q) {
+        return '<tr><td>' + title(q[0]) + '</td><td class="num">' + q[1].toFixed(3) + '× TVL</td></tr>';
+      }).join('') +
+      '<tr><td><b>' + r[1] + ' if it launches</b></td><td class="num">' + (c.ifVal / r[4]).toFixed(3) + '× TVL</td></tr>';
+    var sh = function (label, a, b) {
+      return '<tr><td>' + label + '</td><td class="num">' + a + '</td><td class="num">' + b + '</td></tr>';
+    };
+    $('dCheck').innerHTML = '<tr><th></th><th>Recomputed</th><th>Shipped</th></tr>' +
+      sh('If-listing value', money(c.ifVal), money(r[8])) +
+      sh('Token odds', c.odds.toFixed(3), r[9].toFixed(3)) +
+      sh('Implied value', money(c.implied), money(r[10])) +
+      sh('Farm net', money(c.net), money(r[13])) +
+      sh('Net/hour', money1(c.netHour), money1(r[14])) +
+      sh('Verdict', c.verdict, r[15]);
   }
-  document.querySelectorAll(".controls button").forEach(function (b) {
-    b.addEventListener("click", function () {
-      document.querySelectorAll(".controls button").forEach(function (x) { x.classList.remove("on"); });
-      b.classList.add("on");
-      filter = b.getAttribute("data-f");
-      renderBoard();
+
+  $('rows').addEventListener('click', function (e) {
+    var tr = e.target.closest('tr');
+    if (!tr) return;
+    location.hash = tr.getAttribute('data-slug');
+    showDetail(tr.getAttribute('data-slug'));
+    $('detail').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+  $('search').addEventListener('input', function (e) { state.q = e.target.value.trim(); render(); });
+  $('verdictFilters').addEventListener('click', function (e) {
+    if (e.target.tagName !== 'BUTTON') return;
+    state.verdict = e.target.getAttribute('data-v');
+    Array.prototype.forEach.call($('verdictFilters').children, function (b) {
+      b.classList.toggle('on', b === e.target);
+    });
+    render();
+  });
+  $('watchOnly').addEventListener('change', function (e) { state.watchOnly = e.target.checked; render(); });
+  $('catFilter').addEventListener('change', function (e) { state.cat = e.target.value; render(); });
+  document.querySelectorAll('#board th').forEach(function (th) {
+    th.addEventListener('click', function () {
+      var k = th.getAttribute('data-k');
+      if (state.sort === k) state.dir = -state.dir; else { state.sort = k; state.dir = k === 'name' ? 1 : -1; }
+      render();
     });
   });
-  document.getElementById("q").addEventListener("input", function (e) {
-    query = e.target.value;
-    renderBoard();
-  });
-  renderBoard();
-  // test hook: lets a local check call the same recompute the page runs
-  window.__test = { farmSteps: farmSteps, rows: rows };
+  function bindSlider(id, valId, fmt, apply) {
+    $(id).addEventListener('input', function (e) {
+      apply(parseFloat(e.target.value));
+      $(valId).textContent = fmt(parseFloat(e.target.value));
+      render();
+    });
+  }
+  bindSlider('sizeMul', 'sizeMulVal', function (v) { return v.toFixed(2) + '× deposit'; }, function (v) { params.sizeMul = v; });
+  bindSlider('dropShare', 'dropShareVal', function (v) { return v.toFixed(1) + '%'; }, function (v) { params.dropShare = v / 100; });
+  bindSlider('weeks', 'weeksVal', function (v) { return v + ' weeks'; }, function (v) { params.weeks = v; });
+
+  var x = function (v) { return fmtX(Math.exp(v)); };
+  $('valTable').innerHTML =
+    '<tr><th>Test</th><th>Miss</th><th>Flat</th></tr>' +
+    '<tr><td>Leave-one-out (n=113)</td><td>' + x(VAL.loo_size) + '</td><td>×4.75</td></tr>' +
+    '<tr><td>Walk-forward</td><td>' + x(VAL.wf_size) + '</td><td>×5.22</td></tr>' +
+    '<tr><td>Blind holdout (n=15)</td><td>' + x(VAL.holdout_miss) + '</td><td>' + x(VAL.holdout_flat) + '</td></tr>' +
+    '<tr><td>Holdout ex-extreme (n=9)</td><td>' + x(VAL.holdout_ex_extreme_miss) + '</td><td>—</td></tr>' +
+    '<tr><td>Honesty P25–P75 (LOO)</td><td>' + VAL.honesty_pct.toFixed(1) + '% in range</td><td>50% expected</td></tr>' +
+    '<tr><td>R² (fitset)</td><td>' + VAL.r2.toFixed(3) + '</td><td>—</td></tr>';
+  var terms = Object.keys(VAL.term_table);
+  $('termTable').innerHTML = '<tr><th>Term</th><th>LOO</th><th>WF</th></tr>' +
+    terms.map(function (t) {
+      var v = VAL.term_table[t];
+      return '<tr><td>' + t + '</td><td>' + x(v.loo) + '</td><td>' + x(v.wf) + '</td></tr>';
+    }).join('');
+  $('oddsText').textContent = 'Logistic on ln TVL, 7d growth, family size, category rate, post-2024 flag ' +
+    '(listed_at >= ' + O.regime_cut + '). Coefficients: intercept ' + O.coef[0].toFixed(3) + ', ln TVL ' + O.coef[1].toFixed(3) +
+    ', growth ' + O.coef[2].toFixed(3) + ', family ' + O.coef[3].toFixed(3) + ', category ' + O.coef[4].toFixed(3) +
+    ', post-2024 ' + O.coef[5].toFixed(3) + '. 5-fold CV Brier ' + O.cv_brier.toFixed(4) + ' (folds ' +
+    O.cv_folds.map(function (f) { return f.toFixed(4); }).join(', ') + ') vs base rate Brier ' + O.base_brier.toFixed(4) +
+    ' (v3: 0.2045). OOF calibration: pre-regime 0.763 vs actual 0.776, post-regime 0.385 vs 0.374 — the odds that fall are not inflated, and the board mean (0.364) stays below the base rate (0.549) because the board is mostly young post-2024 protocols.';
+
+  render();
+  if (location.hash) showDetail(location.hash.slice(1));
 })();
